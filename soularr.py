@@ -1520,6 +1520,32 @@ def main():
             logger.error("Exiting...")
             sys.exit(0)
 
+        # Phase 1.5 — slskd adoption.
+        # Reconcile state.albums with slskd's reality so the dedup filter that
+        # follows correctly skips any album that is already being downloaded by
+        # slskd (whether Soularr started it, the user grabbed it manually in
+        # the slskd UI, or a prior cycle started it before our state existed).
+        adopt_enabled = config.getboolean("Adopt Settings", "enabled", fallback=True)
+        if adopt_enabled and state is not None:
+            try:
+                from adopt import sync_state_with_slskd
+
+                fuzzy_threshold = config.getfloat(
+                    "Adopt Settings", "fuzzy_threshold", fallback=0.7
+                )
+                wanted_ids = {r["id"] for r in wanted_records if r.get("id")}
+                adopted = sync_state_with_slskd(
+                    state=state,
+                    slskd=slskd,
+                    lidarr=lidarr,
+                    wanted_album_ids=wanted_ids,
+                    fuzzy_threshold=fuzzy_threshold,
+                )
+                if adopted:
+                    logger.info(f"Adopted {adopted} active slskd download(s) into state")
+            except Exception:
+                logger.exception("Adopt sync failed; continuing with normal cycle")
+
         if len(wanted_records) > 0:
             try:
                 filtered = filter_list(wanted_records)
