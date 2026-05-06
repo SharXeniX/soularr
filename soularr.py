@@ -19,6 +19,8 @@ import slskd_api
 from pyarr import LidarrAPI
 from slskd_api.apis import users
 
+from state import State
+
 
 class EnvInterpolation(configparser.ExtendedInterpolation):
     """
@@ -85,6 +87,7 @@ search_blacklist = []
 search_cache = {}
 folder_cache = {}
 broken_user = []
+state: State | None = None  # initialized in main(), persistent TinyDB store
 
 
 def album_match(lidarr_tracks, slskd_tracks, username, filetype):
@@ -406,11 +409,26 @@ def filter_list(albums):
     """
     temp_list = copy.deepcopy(albums)
 
-    if failed_import_denylist:
-        import_denylist = load_failed_import_denylist(failed_import_denylist_file_path)
+    # Phase 1 dedup: skip albums that already have an in-flight slskd grab tracked in State.
+    if state is not None:
+        before = len(temp_list)
         filtered_temp = []
         for album in temp_list:
-            if str(album["id"]) in import_denylist:
+            if state.is_in_flight(album["id"]):
+                logger.info(
+                    f"Skipping in-flight album: {album['artist']['artistName']} - "
+                    f"{album['title']} (ID: {album['id']})"
+                )
+            else:
+                filtered_temp.append(album)
+        temp_list = filtered_temp
+        if before != len(temp_list):
+            logger.info(f"In-flight dedup: {before} -> {len(temp_list)} albums kept")
+
+    if failed_import_denylist and state is not None:
+        filtered_temp = []
+        for album in temp_list:
+            if state.is_in_failed_imports(album["id"]):
                 logger.info(f"Skipping failed import album: {album['artist']['artistName']} - {album['title']} (ID: {album['id']})")
             else:
                 filtered_temp.append(album)
@@ -735,6 +753,7 @@ def find_download(album, grab_list):
                 grab_list[album_id]["title"] = album["title"]
                 grab_list[album_id]["artist"] = artist_name
                 grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                _state_register_from_grab(album_id, grab_list[album_id], downloads)
                 return True
             elif len(release["media"]) > 1:
                 found, downloads = try_multi_enqueue(release, all_tracks, results, allowed_filetype)
@@ -745,8 +764,37 @@ def find_download(album, grab_list):
                     grab_list[album_id]["title"] = album["title"]
                     grab_list[album_id]["artist"] = artist_name
                     grab_list[album_id]["year"] = album["releaseDate"][0:4]
+                    _state_register_from_grab(album_id, grab_list[album_id], downloads)
                     return True
     return False
+
+
+def _state_register_from_grab(album_id, grab_entry, downloads):
+    """Translate the grab_list entry + slskd-enqueued downloads into a state.register_grab call."""
+    if state is None or not downloads:
+        return
+    transfers = {}
+    chosen_user = None
+    for d in downloads:
+        tid = d.get("id")
+        if not tid:
+            continue
+        if chosen_user is None:
+            chosen_user = d.get("username")
+        transfers[tid] = {
+            "filename": d.get("filename", "").split("\\")[-1],
+            "size": d.get("size", 0),
+            "state": (d.get("status") or {}).get("state", "Queued, Locally"),
+            "imported": False,
+        }
+    state.register_grab(
+        album_id=album_id,
+        artist=grab_entry["artist"],
+        title=grab_entry["title"],
+        year=grab_entry["year"],
+        current_user=chosen_user or "",
+        transfers=transfers,
+    )
 
 
 def search_and_queue(albums):
@@ -873,6 +921,8 @@ def monitor_downloads(grab_list, failed_grab):
     def delete_album(reason):
         cancel_and_delete(grab_list[album_id]["files"])
         logger.info(f"{reason} Album: {grab_list[album_id]['title']} Artist: {grab_list[album_id]['artist']}")
+        if state is not None:
+            state.cleanup_terminal(album_id)
         del grab_list[album_id]
         failed_grab.append(lidarr.get_album(album_id))
 
@@ -938,6 +988,16 @@ def monitor_downloads(grab_list, failed_grab):
                 grab_list[album_id]["error_count"] = grab_list[album_id].get("error_count", 0) + 1
                 continue
 
+            # Sync this album's transfer statuses into the persistent state store.
+            if state is not None:
+                snapshot = {
+                    f["id"]: (f.get("status") or {}).get("state", "")
+                    for f in grab_list[album_id]["files"]
+                    if f.get("id")
+                }
+                if snapshot:
+                    state.update_transfers_bulk(album_id, snapshot)
+
             album_done, problems, queued = downloads_all_done(grab_list[album_id]["files"])
 
             grab_list[album_id].setdefault("count_start", time.time())
@@ -955,6 +1015,8 @@ def monitor_downloads(grab_list, failed_grab):
                 album_data["album_id"] = album_id
                 logger.info(f"Completed download of Album: {album_data['title']} Artist: {album_data['artist']}")
                 process_completed_album(album_data, failed_grab)
+                if state is not None:
+                    state.cleanup_terminal(album_id)
                 del grab_list[album_id]
                 continue
 
@@ -1078,25 +1140,20 @@ def setup_logging(config, var_dir):
 
 
 def get_current_page(path: str, default_page=1) -> int:
-    if os.path.exists(path):
-        with open(path, "r") as file:
-            page_string = file.read().strip()
-
-            if page_string:
-                return int(page_string)
-            else:
-                with open(path, "w") as file:
-                    file.write(str(default_page))
-                return default_page
-    else:
-        with open(path, "w") as file:
-            file.write(str(default_page))
+    """Compat shim: reads from the State store. `path` arg kept for signature compat."""
+    if state is None:
         return default_page
+    return state.get_current_page(default_page)
 
 
 def update_current_page(path: str, page: str) -> None:
-    with open(path, "w") as file:
-        file.write(page)
+    """Compat shim: writes to the State store. `path` arg kept for signature compat."""
+    if state is None:
+        return
+    try:
+        state.set_current_page(int(page))
+    except (TypeError, ValueError):
+        pass
 
 
 def get_records(missing: bool) -> list:
@@ -1217,17 +1274,14 @@ def save_failed_import_denylist(file_path, denylist):
 
 
 def add_to_failed_import_denylist(file_path, album_id, artist, title, folder_path=None):
-    denylist = load_failed_import_denylist(file_path)
-    album_key = str(album_id)
-    if album_key not in denylist:
-        denylist[album_key] = {
-            "album_id": album_id,
-            "artist": artist,
-            "title": title,
-            "failed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "folder_path": folder_path,
-        }
-        save_failed_import_denylist(file_path, denylist)
+    """
+    Compatibility shim: forwards to the State store. The file_path arg is kept for
+    signature compatibility with existing callers.
+    """
+    if state is None:
+        return
+    if not state.is_in_failed_imports(album_id):
+        state.add_failed_import(album_id, artist, title, folder_path or "")
         logger.info(f"Added to failed import denylist: {artist} - {title} (ID: {album_id})")
 
 
@@ -1271,6 +1325,7 @@ def main():
         slskd, \
         config, \
         logger, \
+        state, \
         search_cache, \
         folder_cache, \
         broken_user
@@ -1317,6 +1372,10 @@ def main():
     config_file_path = os.path.join(args.config_dir, "config.ini")
     current_page_file_path = os.path.join(args.var_dir, ".current_page.txt")
     failed_import_denylist_file_path = os.path.join(args.var_dir, "failed_imports.json")
+
+    # Initialize the persistent state store. This also runs the one-shot migration of
+    # legacy JSON files (failed_imports.json, current_page.json) into TinyDB.
+    state = State(args.var_dir)
 
     if not is_docker() and os.path.exists(lock_file_path) and args.lock_file:
         logger.info(f"Soularr instance is already running.")
