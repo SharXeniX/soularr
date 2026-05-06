@@ -38,6 +38,9 @@ function showView(name, btn) {
     if (name === 'failed-imports') {
         loadFailedImports();
     }
+    if (name === 'orphans') {
+        loadOrphans();
+    }
     if (mobileQuery.matches) closeSidebar();
 }
 
@@ -220,6 +223,152 @@ function removeFailedImport(albumId) {
     fetch(`/api/failed-imports/${albumId}`, { method: 'DELETE' })
         .then(r => r.json())
         .then(() => loadFailedImports());
+}
+
+// ---------------------------------------------------------------------------
+// Orphans
+// ---------------------------------------------------------------------------
+
+const ORPHAN_STATUS_LABEL = {
+    pending: 'Pending',
+    partial_imported: 'Partial',
+    no_match: 'No match',
+    error: 'Error',
+    ignored: 'Ignored',
+    empty: 'Empty',
+    deleted: 'Deleted',
+};
+
+function loadOrphans() {
+    const filter = document.getElementById('orphan-filter').value;
+    fetch('/api/orphans')
+        .then(r => r.json())
+        .then(data => {
+            const tbody = document.getElementById('orphans-body');
+            const empty = document.getElementById('orphans-empty');
+            const count = document.getElementById('orphans-count');
+            tbody.innerHTML = '';
+            const items = (Array.isArray(data) ? data : []).filter(it => filter === 'all' || it.status === filter);
+            if (items.length === 0) {
+                empty.style.display = 'block';
+                count.textContent = '';
+                return;
+            }
+            empty.style.display = 'none';
+            count.textContent = `${items.length} entr${items.length === 1 ? 'y' : 'ies'}`;
+            items.forEach(it => {
+                const tr = document.createElement('tr');
+                const folder = it.folder_path || '';
+                const folderShort = folder.split('/').pop();
+                const label = ORPHAN_STATUS_LABEL[it.status] || it.status;
+                const audioCount = it.audio_file_count || 0;
+                const folderExists = it.folder_exists;
+                const fp = encodeURIComponent(folder);
+
+                const artist = it.artist || '—';
+                const albumLabel = it.album_title
+                    ? (it.year ? `${it.album_title} (${it.year})` : it.album_title)
+                    : (it.matched_album_id ? `#${it.matched_album_id}` : '—');
+
+                tr.innerHTML = `
+                    <td><span class="orphan-folder" title="${folder} — status: ${label}">${folderShort}</span></td>
+                    <td>${artist}</td>
+                    <td>${albumLabel}</td>
+                    <td>${audioCount}${folderExists ? '' : ' <em>(folder gone)</em>'}</td>
+                    <td>
+                        <button class="toolbar-btn" onclick="previewOrphan('${fp}')">Details</button>
+                        <button class="toolbar-btn" onclick="importOrphan('${fp}', false)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
+                        <button class="toolbar-btn" onclick="importOrphan('${fp}', true)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
+                        <button class="toolbar-btn" onclick="rescanOrphan('${fp}')">Re-scan</button>
+                        <button class="toolbar-btn" onclick="ignoreOrphan('${fp}')">Ignore</button>
+                        <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${fp}')">Delete</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => console.error('loadOrphans failed', err));
+}
+
+function _orphanAction(folder_path_encoded, endpoint, body) {
+    const folder = decodeURIComponent(folder_path_encoded);
+    const payload = Object.assign({ folder_path: folder }, body || {});
+    return fetch(`/api/orphans/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(r => r.json());
+}
+
+function importOrphan(fp, force) {
+    _orphanAction(fp, 'import', { force: !!force }).then(r => {
+        const decoded = decodeURIComponent(fp);
+        if (r.error) {
+            alert(`Import error: ${r.error}`);
+        } else if (r.imported_count > 0) {
+            alert(`Imported ${r.imported_count} of ${r.accepted_count} files from ${decoded}`);
+        } else {
+            alert(`No files imported. ${r.message || ''}\nTry "Force" to override soft rejections.`);
+        }
+        loadOrphans();
+    });
+}
+
+function ignoreOrphan(fp) {
+    _orphanAction(fp, 'ignore').then(() => loadOrphans());
+}
+
+function rescanOrphan(fp) {
+    _orphanAction(fp, 'rescan').then(() => loadOrphans());
+}
+
+function deleteOrphan(fp) {
+    if (!confirm(`Delete ${decodeURIComponent(fp)} from disk? This removes all files in the folder.`)) return;
+    _orphanAction(fp, 'delete').then(() => loadOrphans());
+}
+
+function previewOrphan(fp) {
+    const folder = decodeURIComponent(fp);
+    document.getElementById('orphan-modal-title').textContent = folder;
+    const body = document.getElementById('orphan-modal-body');
+    body.innerHTML = '<em>Loading…</em>';
+    document.getElementById('orphan-detail-modal').style.display = 'flex';
+    fetch('/api/orphans/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder_path: folder }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                body.innerHTML = `<div class="level-error">Preview error: ${data.error}</div>`;
+                return;
+            }
+            const files = data.files || [];
+            if (files.length === 0) {
+                body.innerHTML = '<em>Lidarr returned no candidates for this folder.</em>';
+                return;
+            }
+            const rows = files.map(f => {
+                const rej = (f.rejections || []).map(r => r.reason || r).join('; ');
+                const album = f.album ? f.album.title : '—';
+                const quality = f.quality && f.quality.quality ? f.quality.quality.name : '—';
+                return `<tr>
+                    <td>${(f.name || '').split('/').pop()}</td>
+                    <td>${quality}</td>
+                    <td>${album}</td>
+                    <td class="${rej ? 'level-warn' : ''}">${rej || '<span class="level-info">accepted</span>'}</td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `<table class="failed-imports-table">
+                <thead><tr><th>File</th><th>Quality</th><th>Album</th><th>Rejections</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        });
+}
+
+function closeOrphanModal() {
+    document.getElementById('orphan-detail-modal').style.display = 'none';
 }
 
 const es = new EventSource('/stream');

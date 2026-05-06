@@ -42,6 +42,10 @@
                 <span class="icon icon-ban"></span>
                 Failed Imports
             </button>
+            <button class="nav-btn" onclick="showView('orphans', this)">
+                <span class="icon icon-ban"></span>
+                Orphans
+            </button>
             <button class="nav-btn" onclick="showView('settings', this)">
                 <span class="icon icon-settings"></span>
                 Settings
@@ -76,6 +80,46 @@
                         </tbody>
                     </table>
                     <div id="failed-imports-empty" class="failed-imports-empty" style="display:none">No failed imports.</div>
+                </div>
+            </div>
+
+            <div id="view-orphans" class="view">
+                <div class="log-toolbar">
+                    <button class="toolbar-btn" onclick="loadOrphans()">Refresh</button>
+                    <select id="orphan-filter" class="toolbar-btn" onchange="loadOrphans()">
+                        <option value="all">All statuses</option>
+                        <option value="pending">Pending</option>
+                        <option value="partial_imported">Partial imported</option>
+                        <option value="no_match">No match</option>
+                        <option value="error">Error</option>
+                        <option value="ignored">Ignored</option>
+                        <option value="empty">Empty</option>
+                    </select>
+                    <span id="orphans-count" class="settings-path"></span>
+                </div>
+                <div class="failed-imports-wrap">
+                    <table class="failed-imports-table" id="orphans-table">
+                        <thead>
+                            <tr>
+                                <th>Folder</th>
+                                <th>Artist</th>
+                                <th>Album</th>
+                                <th>Audio files</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="orphans-body"></tbody>
+                    </table>
+                    <div id="orphans-empty" class="failed-imports-empty" style="display:none">No orphans.</div>
+                </div>
+                <div id="orphan-detail-modal" class="orphan-modal" style="display:none">
+                    <div class="orphan-modal-content">
+                        <div class="orphan-modal-header">
+                            <span id="orphan-modal-title"></span>
+                            <button class="toolbar-btn" onclick="closeOrphanModal()">Close</button>
+                        </div>
+                        <div id="orphan-modal-body"></div>
+                    </div>
                 </div>
             </div>
 
