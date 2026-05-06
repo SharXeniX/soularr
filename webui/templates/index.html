@@ -5,7 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Soularr Web UI</title>
     <link rel="icon" href="/resources/favicon.ico" type="image/x-icon">
-    <link rel="stylesheet" href="/static/style.css">
+
+    <!-- Per-concern stylesheets, loaded in dependency order. -->
+    <link rel="stylesheet" href="/static/css/base.css">
+    <link rel="stylesheet" href="/static/css/data-table.css">
+    <link rel="stylesheet" href="/static/css/logs.css">
+    <link rel="stylesheet" href="/static/css/failed-imports.css">
+    <link rel="stylesheet" href="/static/css/orphans.css">
+    <link rel="stylesheet" href="/static/css/settings.css">
+
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.17/codemirror.min.css">
 </head>
 <body>
@@ -38,6 +46,10 @@
                 <span class="icon icon-logs"></span>
                 Logs
             </button>
+            <button class="nav-btn" onclick="showView('orphans', this)">
+                <span class="icon icon-ban"></span>
+                Orphans
+            </button>
             <button class="nav-btn" onclick="showView('failed-imports', this)">
                 <span class="icon icon-ban"></span>
                 Failed Imports
@@ -49,45 +61,10 @@
         </nav>
 
         <div class="content">
-            <div id="view-logs" class="view active">
-                <div class="log-toolbar">
-                    <button id="scroll-btn" class="toolbar-btn active" onclick="toggleScroll()">Auto-scroll</button>
-                    <button class="toolbar-btn" onclick="clearLog()">Clear</button>
-                    <div class="toolbar-spacer"></div>
-                </div>
-                <div id="log"></div>
-            </div>
-
-            <div id="view-failed-imports" class="view">
-                <div class="log-toolbar">
-                    <button class="toolbar-btn" onclick="loadFailedImports()">Refresh</button>
-                    <span id="failed-imports-count" class="settings-path"></span>
-                </div>
-                <div class="failed-imports-wrap">
-                    <table class="failed-imports-table">
-                        <thead>
-                            <tr>
-                                <th>Artist</th>
-                                <th>Album</th>
-                                <th>Failed At</th>
-                            </tr>
-                        </thead>
-                        <tbody id="failed-imports-body">
-                        </tbody>
-                    </table>
-                    <div id="failed-imports-empty" class="failed-imports-empty" style="display:none">No failed imports.</div>
-                </div>
-            </div>
-
-            <div id="view-settings" class="view">
-                <div class="settings-toolbar">
-                    <button id="save-btn" class="toolbar-btn" onclick="saveConfig()">Save</button>
-                    <span class="settings-path" id="config-path"></span>
-                </div>
-                <div id="editor-wrap">
-                    <textarea id="config-editor" spellcheck="false"></textarea>
-                </div>
-            </div>
+            {% include "partials/_logs.html" %}
+            {% include "partials/_orphans.html" %}
+            {% include "partials/_failed_imports.html" %}
+            {% include "partials/_settings.html" %}
         </div>
     </div>
 

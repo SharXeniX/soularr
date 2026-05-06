@@ -238,35 +238,112 @@ class State:
     # Runtime singletons (current_page etc.)
     # ------------------------------------------------------------------
     def get_current_page(self, default: int = 1) -> int:
-        Q = Query()
-        with self._tlock:
-            doc = self._runtime.get(Q.key == "current_page")
-            return doc["value"] if doc else default
+        return self.get_runtime("current_page", default)
 
     def set_current_page(self, page: int):
-        Q = Query()
-        with self._flock():
-            self._runtime.upsert(
-                {"key": "current_page", "value": page},
-                Q.key == "current_page",
-            )
+        self.set_runtime("current_page", page)
 
-    # ------------------------------------------------------------------
-    # Orphans — Phase 2b stub
-    # ------------------------------------------------------------------
-    def is_orphan_scanned(self, folder_path: str) -> bool:
+    def get_runtime(self, key: str, default=None):
+        """Generic key/value lookup in the runtime table."""
         Q = Query()
         with self._tlock:
-            return self._orphans.contains(Q.folder_path == folder_path)
+            doc = self._runtime.get(Q.key == key)
+            return doc["value"] if doc else default
 
-    def mark_orphan_scanned(self, folder_path: str, matched_album_id: int = None):
+    def set_runtime(self, key: str, value):
         Q = Query()
         with self._flock():
-            self._orphans.upsert(
-                {
-                    "folder_path": folder_path,
-                    "scanned_at": _now(),
-                    "matched_album_id": matched_album_id,
-                },
-                Q.folder_path == folder_path,
-            )
+            self._runtime.upsert({"key": key, "value": value}, Q.key == key)
+
+    # ------------------------------------------------------------------
+    # Tracked-folder lookup (used by orphan scan to skip in-flight folders)
+    # ------------------------------------------------------------------
+    def get_tracked_folder_names(self) -> set:
+        """
+        Return the set of slskd local-folder names (the last segment of file_dir)
+        that correspond to currently in-flight transfers. Orphan scan should skip
+        any /downloads subfolder whose name appears here.
+        """
+        names = set()
+        with self._tlock:
+            for album in self._albums.all():
+                for t in album.get("transfers", {}).values():
+                    fd = t.get("file_dir") or ""
+                    if not fd:
+                        continue
+                    last = fd.replace("/", "\\").split("\\")[-1]
+                    if last:
+                        names.add(last)
+        return names
+
+    # ------------------------------------------------------------------
+    # Orphans — Phase 2b
+    # ------------------------------------------------------------------
+    # Status values written into the orphans table.
+    # Auto-import success is NOT recorded — the folder is deleted afterwards so
+    # there is nothing to track. Anything else either awaits user action via the
+    # orphans UI page or is already at a terminal state.
+    ORPHAN_STATUS_PENDING = "pending"            # detected, not in wanted list — awaits UI action
+    ORPHAN_STATUS_PARTIAL_IMPORTED = "partial_imported"  # auto-imported some, but residual audio remains
+    ORPHAN_STATUS_NO_MATCH = "no_match"          # was wanted but Lidarr rejected every file
+    ORPHAN_STATUS_ERROR = "error"                # ManualImport command failed / timed out
+    ORPHAN_STATUS_EMPTY = "empty"                # no audio file in folder
+    ORPHAN_STATUS_IGNORED = "ignored"            # user opted out via UI
+    ORPHAN_STATUS_DELETED = "deleted"            # user deleted folder via UI (audit trail)
+
+    # Pending orphans are RE-EVALUATED on every scan because the wanted list is
+    # mutable: an album the user adds or re-monitors should auto-import the next
+    # time we see its folder. Everything else is terminal until the user clears
+    # the entry from the UI.
+    _ORPHAN_TERMINAL_STATUSES = {
+        ORPHAN_STATUS_PARTIAL_IMPORTED,
+        ORPHAN_STATUS_NO_MATCH,
+        ORPHAN_STATUS_ERROR,
+        ORPHAN_STATUS_EMPTY,
+        ORPHAN_STATUS_IGNORED,
+        ORPHAN_STATUS_DELETED,
+    }
+
+    def is_orphan_resolved(self, folder_path: str) -> bool:
+        Q = Query()
+        with self._tlock:
+            doc = self._orphans.get(Q.folder_path == folder_path)
+            return bool(doc) and doc.get("status") in self._ORPHAN_TERMINAL_STATUSES
+
+    def mark_orphan_scanned(
+        self,
+        folder_path: str,
+        status: str,
+        matched_album_id: int = None,
+        lidarr_command_id: int = None,
+        imported_count: int = 0,
+        rejections: list = None,
+    ):
+        Q = Query()
+        doc = {
+            "folder_path": folder_path,
+            "scanned_at": _now(),
+            "status": status,
+            "matched_album_id": matched_album_id,
+            "lidarr_command_id": lidarr_command_id,
+            "imported_count": imported_count,
+        }
+        if rejections is not None:
+            doc["rejections"] = list(rejections)
+        with self._flock():
+            self._orphans.upsert(doc, Q.folder_path == folder_path)
+
+    def get_orphan(self, folder_path: str) -> dict:
+        Q = Query()
+        with self._tlock:
+            return self._orphans.get(Q.folder_path == folder_path)
+
+    def list_orphans(self) -> list:
+        with self._tlock:
+            return self._orphans.all()
+
+    def remove_orphan(self, folder_path: str):
+        """Drop an orphan entry entirely (used after a fully successful auto-import)."""
+        Q = Query()
+        with self._flock():
+            self._orphans.remove(Q.folder_path == folder_path)

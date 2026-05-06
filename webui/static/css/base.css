@@ -1,0 +1,252 @@
+/* Global reset, layout, sidebar, header, navigation, toolbar primitives. */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    background: #141414;
+    color: #d0d0d0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.hidden { display: none !important; }
+
+/* Header ------------------------------------------------------------------ */
+
+header {
+    background: #0e0e0e;
+    border-bottom: 1px solid #252525;
+    padding: 10px 20px 10px 0;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    z-index: 10;
+    position: relative;
+}
+
+header .header-brand {
+    width: 199px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+header img { height: 44px; }
+
+header .divider {
+    width: 1px;
+    height: 24px;
+    background: #252525;
+    margin: 0 20px 0 0;
+    flex-shrink: 0;
+}
+
+header .header-title {
+    font-size: 15px;
+    color: #555;
+    letter-spacing: 0.05em;
+}
+
+header .header-links {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+header .header-links a {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px;
+    border-radius: 6px;
+    color: #888;
+    text-decoration: none;
+    transition: background 0.15s;
+}
+
+header .header-links a:hover {
+    background: #1e1e1e;
+    color: #d0d0d0;
+}
+
+/* Layout, sidebar, navigation -------------------------------------------- */
+
+.layout {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+}
+
+.sidebar {
+    width: 200px;
+    background: #0e0e0e;
+    border-right: 1px solid #252525;
+    padding: 12px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+}
+
+.nav-btn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    color: #777;
+    font-size: 14px;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    transition: color 0.15s, background 0.15s;
+}
+
+.nav-btn:hover { color: #d0d0d0; background: #1a1a1a; }
+.nav-btn.active { color: #d0d0d0; background: #1a2e1a; }
+
+.icon {
+    display: block;
+    flex-shrink: 0;
+    background-color: currentColor;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    -webkit-mask-position: center;
+    mask-position: center;
+}
+
+.icon-logs     { width: 16px; height: 16px; -webkit-mask-image: url('/resources/logs.svg');     mask-image: url('/resources/logs.svg'); }
+.icon-settings { width: 16px; height: 16px; -webkit-mask-image: url('/resources/settings.svg'); mask-image: url('/resources/settings.svg'); }
+.icon-ban      { width: 16px; height: 16px; -webkit-mask-image: url('/resources/ban.svg');      mask-image: url('/resources/ban.svg'); }
+.icon-github   { width: 22px; height: 22px; -webkit-mask-image: url('/resources/github.svg');   mask-image: url('/resources/github.svg'); }
+.icon-sponsor  { width: 22px; height: 22px; -webkit-mask-image: url('/resources/sponsor.svg');  mask-image: url('/resources/sponsor.svg'); }
+.icon-menu     { width: 20px; height: 20px; -webkit-mask-image: url('/resources/menu.svg');     mask-image: url('/resources/menu.svg'); }
+
+.menu-toggle {
+    display: none;
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #888;
+    padding: 8px 4px;
+    margin-left: 12px;
+    flex-shrink: 0;
+    transition: color 0.15s;
+}
+
+.menu-toggle:hover { color: #d0d0d0; }
+
+.sidebar-overlay {
+    display: none;
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 99;
+}
+
+.sidebar-overlay.visible { display: block; }
+
+/* Content area ----------------------------------------------------------- */
+
+.content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.view {
+    display: none;
+    flex: 1;
+    flex-direction: column;
+    overflow: hidden;
+    padding: 16px 20px 20px;
+}
+
+.view.active { display: flex; }
+
+/* Toolbar primitives shared across pages --------------------------------- */
+
+.page-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    margin-bottom: 10px;
+    gap: 8px;
+}
+
+.toolbar-spacer { flex: 1; }
+
+.toolbar-btn {
+    background: #1e1e1e;
+    border: 1px solid #303030;
+    color: #888;
+    padding: 4px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.toolbar-btn:hover { color: #d0d0d0; border-color: #505050; }
+.toolbar-btn.active { color: #d0d0d0; background: #1a2e1a; border-color: #2d4f2d; }
+.toolbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.toolbar-meta {
+    font-family: 'Consolas', 'Cascadia Code', 'Monaco', monospace;
+    font-size: 11px;
+    color: #505050;
+}
+
+.remove-btn {
+    color: #804040;
+    border-color: #3a2020;
+    flex-shrink: 0;
+}
+
+.remove-btn:hover {
+    color: #d04040;
+    border-color: #5a2020;
+    background: #1e1010;
+}
+
+/* Mobile breakpoint ------------------------------------------------------ */
+
+@media (pointer: coarse) and (hover: none), (max-width: 768px) {
+    .menu-toggle { display: flex; align-items: center; }
+
+    header .header-brand { width: auto; padding-left: 19px; }
+    .menu-toggle { margin-left: 6px; }
+    header .divider { display: none; }
+    header .header-title {
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        pointer-events: none;
+    }
+
+    .layout { position: relative; }
+
+    .sidebar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        bottom: 0;
+        z-index: 100;
+        transform: translateX(-100%);
+        transition: transform 0.22s ease;
+    }
+
+    .sidebar.open { transform: translateX(0); }
+
+    .view { padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
+}

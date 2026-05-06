@@ -781,8 +781,16 @@ def _state_register_from_grab(album_id, grab_entry, downloads):
             continue
         if chosen_user is None:
             chosen_user = d.get("username")
+        full = d.get("filename", "")
+        # slskd separates path components with backslashes; the file_dir is
+        # everything up to the last segment, the basename is the last segment.
+        if "\\" in full:
+            file_dir, basename = full.rsplit("\\", 1)
+        else:
+            file_dir, basename = "", full
         transfers[tid] = {
-            "filename": d.get("filename", "").split("\\")[-1],
+            "filename": basename,
+            "file_dir": file_dir,
             "size": d.get("size", 0),
             "state": (d.get("status") or {}).get("state", "Queued, Locally"),
             "imported": False,
@@ -1468,6 +1476,39 @@ def main():
 
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
+
+        # Phase 2b — orphan recovery
+        # Look at /downloads for folders that aren't tracked nor previously resolved,
+        # try to identify the album in Lidarr, and trigger DownloadedAlbumsScan so
+        # Lidarr can import them naturally.
+        orphan_enabled = config.getboolean("Orphan Settings", "enabled", fallback=True)
+        if orphan_enabled and state is not None:
+            try:
+                from orphans import process_all_orphans
+
+                artist_ratio = config.getfloat(
+                    "Orphan Settings", "artist_name_match_ratio", fallback=0.85
+                )
+                album_ratio = config.getfloat(
+                    "Orphan Settings", "album_name_match_ratio", fallback=0.85
+                )
+                cmd_timeout = config.getint(
+                    "Orphan Settings", "lidarr_command_timeout", fallback=60
+                )
+                processed = process_all_orphans(
+                    soularr_downloads_dir=slskd_download_dir,
+                    lidarr_downloads_dir=lidarr_download_dir,
+                    state=state,
+                    lidarr=lidarr,
+                    artist_match_ratio=artist_ratio,
+                    album_match_ratio=album_ratio,
+                    command_timeout=cmd_timeout,
+                )
+                if processed:
+                    logger.info(f"Orphan scan: processed {processed} folder(s)")
+            except Exception:
+                logger.exception("Orphan scan failed; continuing with normal cycle")
+
         wanted_records = []
         try:
             for source in search_sources:

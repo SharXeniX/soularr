@@ -26,11 +26,28 @@ function closeSidebar() {
     document.querySelector('.sidebar-overlay').classList.remove('visible');
 }
 
+const VIEW_NAMES = ['logs', 'failed-imports', 'orphans', 'settings'];
+
+function _findNavBtn(name) {
+    const buttons = Array.from(document.querySelectorAll('.nav-btn'));
+    return buttons.find(b => (b.getAttribute('onclick') || '').includes("'" + name + "'"));
+}
+
 function showView(name, btn) {
+    if (!VIEW_NAMES.includes(name)) name = 'logs';
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
     document.getElementById('view-' + name).classList.add('active');
-    btn.classList.add('active');
+    const targetBtn = btn || _findNavBtn(name);
+    if (targetBtn) targetBtn.classList.add('active');
+
+    // Reflect the current view in the URL so refresh / bookmarks / back-button
+    // restore the same page.
+    const desired = name === 'logs' ? '/' : '/' + name;
+    if (window.location.pathname !== desired) {
+        history.pushState({view: name}, '', desired);
+    }
+
     if (name === 'settings') {
         loadConfig();
         cmEditor.refresh();
@@ -38,8 +55,39 @@ function showView(name, btn) {
     if (name === 'failed-imports') {
         loadFailedImports();
     }
+    if (name === 'orphans') {
+        loadOrphans();
+    }
     if (mobileQuery.matches) closeSidebar();
 }
+
+// Restore view based on the URL on initial load and on back/forward navigation.
+function _viewFromPath() {
+    const seg = (window.location.pathname || '/').replace(/^\/+|\/+$/g, '');
+    return VIEW_NAMES.includes(seg) ? seg : 'logs';
+}
+
+window.addEventListener('popstate', () => {
+    const name = _viewFromPath();
+    // Don't push another history entry while reacting to popstate
+    document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+    document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('view-' + name).classList.add('active');
+    const btn = _findNavBtn(name);
+    if (btn) btn.classList.add('active');
+    if (name === 'settings') { loadConfig(); cmEditor.refresh(); }
+    if (name === 'failed-imports') { loadFailedImports(); }
+    if (name === 'orphans') { loadOrphans(); }
+});
+
+// Initial restore on page load — but only if it's not the default 'logs'
+// (default markup already has Logs active).
+document.addEventListener('DOMContentLoaded', () => {
+    const initial = _viewFromPath();
+    if (initial !== 'logs') {
+        showView(initial);
+    }
+});
 
 function loadConfig() {
     fetch('/api/config')
@@ -108,7 +156,20 @@ function toggleScroll() {
 }
 
 function clearLog() {
-    log.innerHTML = '';
+    fetch('/api/log/clear', { method: 'POST' })
+        .then(r => r.json())
+        .then(() => {
+            log.innerHTML = '';
+            // Force the EventSource to reconnect so the new (post-offset)
+            // stream starts from the just-cleared point. Without this, the
+            // existing connection would keep sending the lines it already had
+            // queued upstream of the new offset.
+            try { es.close(); } catch (e) {}
+            es = new EventSource('/stream');
+            es.onmessage = e => appendLine(e.data);
+            es.onerror = () => appendLine('--- connection lost, retrying... ---');
+        })
+        .catch(err => console.error('Clear failed', err));
 }
 
 const LOG_FONT_MIN = 4;
@@ -189,10 +250,10 @@ function loadFailedImports() {
             const count = document.getElementById('failed-imports-count');
             tbody.innerHTML = '';
             if (!Array.isArray(data) || data.length === 0) {
-                empty.style.display = 'block';
+                empty.classList.remove('hidden');
                 count.textContent = '';
             } else {
-                empty.style.display = 'none';
+                empty.classList.add('hidden');
                 count.textContent = `${data.length} entr${data.length === 1 ? 'y' : 'ies'}`;
                 data.forEach(entry => {
                     const tr = document.createElement('tr');
@@ -220,6 +281,176 @@ function removeFailedImport(albumId) {
     fetch(`/api/failed-imports/${albumId}`, { method: 'DELETE' })
         .then(r => r.json())
         .then(() => loadFailedImports());
+}
+
+// ---------------------------------------------------------------------------
+// Orphans
+// ---------------------------------------------------------------------------
+
+const ORPHAN_STATUS_LABEL = {
+    pending: 'Pending',
+    partial_imported: 'Partial',
+    no_match: 'No match',
+    error: 'Error',
+    ignored: 'Ignored',
+    empty: 'Empty',
+    deleted: 'Deleted',
+};
+
+function loadOrphans() {
+    const filter = document.getElementById('orphan-filter').value;
+    fetch('/api/orphans')
+        .then(r => r.json())
+        .then(data => {
+            const tbody = document.getElementById('orphans-body');
+            const empty = document.getElementById('orphans-empty');
+            const count = document.getElementById('orphans-count');
+            tbody.innerHTML = '';
+            const items = (Array.isArray(data) ? data : []).filter(it => filter === 'all' || it.status === filter);
+            if (items.length === 0) {
+                empty.classList.remove('hidden');
+                count.textContent = '';
+                return;
+            }
+            empty.classList.add('hidden');
+            count.textContent = `${items.length} entr${items.length === 1 ? 'y' : 'ies'}`;
+            items.forEach(it => {
+                const tr = document.createElement('tr');
+                const folder = it.folder_path || '';
+                const folderShort = folder.split('/').pop();
+                const label = ORPHAN_STATUS_LABEL[it.status] || it.status;
+                const audioCount = it.audio_file_count || 0;
+                const folderExists = it.folder_exists;
+                const fp = encodeURIComponent(folder);
+
+                const artist = it.artist || '—';
+                const baseAlbum = it.album_title
+                    ? (it.year ? `${it.album_title} (${it.year})` : it.album_title)
+                    : (it.matched_album_id ? `#${it.matched_album_id}` : '—');
+
+                // "Already in Lidarr" annotation
+                let inLibNote = '';
+                const tfc = it.track_file_count || 0;
+                const tt = it.total_tracks || 0;
+                if (tfc > 0) {
+                    const qualities = (it.existing_qualities || []).join(', ') || 'unknown';
+                    inLibNote = `<div class="orphan-inlib" title="Lidarr already has ${tfc}/${tt} tracks in quality: ${qualities}">In Lidarr: ${tfc}/${tt} ${qualities}</div>`;
+                }
+
+                const rejections = it.rejections || [];
+                const rejectionText = rejections.length === 0
+                    ? '<span class="orphan-rejection-empty">—</span>'
+                    : rejections.map(r => `<div class="orphan-rejection">${r}</div>`).join('');
+
+                const forceTooltip = 'Force: include files Lidarr would normally reject for soft reasons (Has missing tracks, Album match too low, quality below profile…). Hard rejections like "Already imported" are not overridden.';
+
+                tr.innerHTML = `
+                    <td><span class="orphan-folder" title="${folder} — status: ${label}">${folderShort}</span></td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${artist}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${baseAlbum}${inLibNote}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${audioCount}${folderExists ? '' : ' <em>(folder gone)</em>'}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${rejectionText}</td>
+                    <td>
+                        <div class="row-actions">
+                            <button class="toolbar-btn" onclick="importOrphan('${fp}', false)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
+                            <button class="toolbar-btn" title="${forceTooltip}" onclick="importOrphan('${fp}', true)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
+                            <span class="actions-divider"></span>
+                            <button class="toolbar-btn" onclick="rescanOrphan('${fp}')">Re-scan</button>
+                            <button class="toolbar-btn" onclick="ignoreOrphan('${fp}')">Ignore</button>
+                            <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${fp}')">Delete</button>
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => console.error('loadOrphans failed', err));
+}
+
+function _orphanAction(folder_path_encoded, endpoint, body) {
+    const folder = decodeURIComponent(folder_path_encoded);
+    const payload = Object.assign({ folder_path: folder }, body || {});
+    return fetch(`/api/orphans/${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    }).then(r => r.json());
+}
+
+function importOrphan(fp, force) {
+    _orphanAction(fp, 'import', { force: !!force }).then(r => {
+        const decoded = decodeURIComponent(fp);
+        if (r.error) {
+            alert(`Import error: ${r.error}`);
+        } else if (r.imported_count > 0) {
+            alert(`Imported ${r.imported_count} of ${r.accepted_count} files from ${decoded}`);
+        } else {
+            alert(`No files imported. ${r.message || ''}\nTry "Force" to override soft rejections.`);
+        }
+        loadOrphans();
+    });
+}
+
+function ignoreOrphan(fp) {
+    _orphanAction(fp, 'ignore').then(() => loadOrphans());
+}
+
+function rescanOrphan(fp) {
+    _orphanAction(fp, 'rescan').then(() => loadOrphans());
+}
+
+function deleteOrphan(fp) {
+    if (!confirm(`Delete ${decodeURIComponent(fp)} from disk? This removes all files in the folder.`)) return;
+    _orphanAction(fp, 'delete').then(() => loadOrphans());
+}
+
+function previewOrphan(fp) {
+    const folder = decodeURIComponent(fp);
+    document.getElementById('orphan-modal-title').textContent = folder;
+    const body = document.getElementById('orphan-modal-body');
+    body.innerHTML = '<em>Loading…</em>';
+    document.getElementById('orphan-detail-modal').classList.remove('hidden');
+    fetch('/api/orphans/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder_path: folder }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                body.innerHTML = `<div class="level-error">Preview error: ${data.error}</div>`;
+                return;
+            }
+            const files = data.files || [];
+            if (files.length === 0) {
+                body.innerHTML = '<em>Lidarr returned no candidates for this folder.</em>';
+                return;
+            }
+            files.sort((a, b) => {
+                const an = (a.name || '').split('/').pop().toLowerCase();
+                const bn = (b.name || '').split('/').pop().toLowerCase();
+                return an.localeCompare(bn);
+            });
+            const rows = files.map(f => {
+                const rej = (f.rejections || []).map(r => r.reason || r).join('; ');
+                const album = f.album ? f.album.title : '—';
+                const quality = f.quality && f.quality.quality ? f.quality.quality.name : '—';
+                return `<tr>
+                    <td>${(f.name || '').split('/').pop()}</td>
+                    <td>${quality}</td>
+                    <td>${album}</td>
+                    <td class="${rej ? 'level-warn' : ''}">${rej || '<span class="level-info">accepted</span>'}</td>
+                </tr>`;
+            }).join('');
+            body.innerHTML = `<table class="data-table">
+                <thead><tr><th>File</th><th>Quality</th><th>Album</th><th>Rejections</th></tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        });
+}
+
+function closeOrphanModal() {
+    document.getElementById('orphan-detail-modal').classList.add('hidden');
 }
 
 const es = new EventSource('/stream');

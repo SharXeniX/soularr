@@ -1,0 +1,50 @@
+/* Settings view: CodeMirror config editor. */
+
+#editor-wrap {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #252525;
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+#editor-wrap:focus-within { border-color: #404040; }
+
+.cm-s-soularr.CodeMirror {
+    flex: 1;
+    height: 100%;
+    background: #0e0e0e;
+    color: #d0d0d0;
+    font-family: 'Consolas', 'Cascadia Code', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.65;
+}
+
+.cm-s-soularr .CodeMirror-gutters {
+    background: #0e0e0e;
+    border-right: 1px solid #1e1e1e;
+}
+
+.cm-s-soularr .CodeMirror-linenumber { color: #383838; }
+.cm-s-soularr .CodeMirror-cursor { border-left-color: #d0d0d0; }
+.cm-s-soularr .CodeMirror-selected { background: #1a2e1a; }
+.cm-s-soularr .CodeMirror-activeline-background { background: #161616; }
+
+.cm-s-soularr .cm-comment { color: #4a4a4a; }
+.cm-s-soularr .cm-header  { color: #8aba8a; font-weight: bold; }
+.cm-s-soularr .cm-def     { color: #9db8d2; }
+.cm-s-soularr .cm-quote   { color: #c8b89a; }
+
+#save-btn { width: 70px; }
+#save-btn.saving {
+    text-align: left;
+    padding-left: 18px;
+}
+
+.toolbar-btn.save-error {
+    color: #d0d0d0;
+    background: #2e1a1a;
+    border-color: #4f2d2d;
+}
