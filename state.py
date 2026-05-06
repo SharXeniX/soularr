@@ -252,21 +252,78 @@ class State:
             )
 
     # ------------------------------------------------------------------
-    # Orphans — Phase 2b stub
+    # Tracked-folder lookup (used by orphan scan to skip in-flight folders)
     # ------------------------------------------------------------------
-    def is_orphan_scanned(self, folder_path: str) -> bool:
+    def get_tracked_folder_names(self) -> set:
+        """
+        Return the set of slskd local-folder names (the last segment of file_dir)
+        that correspond to currently in-flight transfers. Orphan scan should skip
+        any /downloads subfolder whose name appears here.
+        """
+        names = set()
+        with self._tlock:
+            for album in self._albums.all():
+                for t in album.get("transfers", {}).values():
+                    fd = t.get("file_dir") or ""
+                    if not fd:
+                        continue
+                    last = fd.replace("/", "\\").split("\\")[-1]
+                    if last:
+                        names.add(last)
+        return names
+
+    # ------------------------------------------------------------------
+    # Orphans — Phase 2b
+    # ------------------------------------------------------------------
+    # Status values written into the orphans table:
+    ORPHAN_STATUS_IMPORTED = "imported"      # Lidarr accepted >= 1 file
+    ORPHAN_STATUS_NO_MATCH = "no_match"      # scan ran, 0 imported
+    ORPHAN_STATUS_ERROR = "error"            # command failed / timed out
+    ORPHAN_STATUS_EMPTY = "empty"            # no audio file in folder
+
+    # An orphan is "resolved" once it has been processed at least once with a
+    # terminal status. We don't retry resolved orphans automatically; the user
+    # can clear the entry to force a re-scan.
+    _ORPHAN_TERMINAL_STATUSES = {
+        ORPHAN_STATUS_IMPORTED,
+        ORPHAN_STATUS_NO_MATCH,
+        ORPHAN_STATUS_ERROR,
+        ORPHAN_STATUS_EMPTY,
+    }
+
+    def is_orphan_resolved(self, folder_path: str) -> bool:
         Q = Query()
         with self._tlock:
-            return self._orphans.contains(Q.folder_path == folder_path)
+            doc = self._orphans.get(Q.folder_path == folder_path)
+            return bool(doc) and doc.get("status") in self._ORPHAN_TERMINAL_STATUSES
 
-    def mark_orphan_scanned(self, folder_path: str, matched_album_id: int = None):
+    def mark_orphan_scanned(
+        self,
+        folder_path: str,
+        status: str,
+        matched_album_id: int = None,
+        lidarr_command_id: int = None,
+        imported_count: int = 0,
+    ):
         Q = Query()
         with self._flock():
             self._orphans.upsert(
                 {
                     "folder_path": folder_path,
                     "scanned_at": _now(),
+                    "status": status,
                     "matched_album_id": matched_album_id,
+                    "lidarr_command_id": lidarr_command_id,
+                    "imported_count": imported_count,
                 },
                 Q.folder_path == folder_path,
             )
+
+    def get_orphan(self, folder_path: str) -> dict:
+        Q = Query()
+        with self._tlock:
+            return self._orphans.get(Q.folder_path == folder_path)
+
+    def list_orphans(self) -> list:
+        with self._tlock:
+            return self._orphans.all()
