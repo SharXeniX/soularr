@@ -238,18 +238,22 @@ class State:
     # Runtime singletons (current_page etc.)
     # ------------------------------------------------------------------
     def get_current_page(self, default: int = 1) -> int:
-        Q = Query()
-        with self._tlock:
-            doc = self._runtime.get(Q.key == "current_page")
-            return doc["value"] if doc else default
+        return self.get_runtime("current_page", default)
 
     def set_current_page(self, page: int):
+        self.set_runtime("current_page", page)
+
+    def get_runtime(self, key: str, default=None):
+        """Generic key/value lookup in the runtime table."""
+        Q = Query()
+        with self._tlock:
+            doc = self._runtime.get(Q.key == key)
+            return doc["value"] if doc else default
+
+    def set_runtime(self, key: str, value):
         Q = Query()
         with self._flock():
-            self._runtime.upsert(
-                {"key": "current_page", "value": page},
-                Q.key == "current_page",
-            )
+            self._runtime.upsert({"key": key, "value": value}, Q.key == key)
 
     # ------------------------------------------------------------------
     # Tracked-folder lookup (used by orphan scan to skip in-flight folders)
@@ -313,20 +317,21 @@ class State:
         matched_album_id: int = None,
         lidarr_command_id: int = None,
         imported_count: int = 0,
+        rejections: list = None,
     ):
         Q = Query()
+        doc = {
+            "folder_path": folder_path,
+            "scanned_at": _now(),
+            "status": status,
+            "matched_album_id": matched_album_id,
+            "lidarr_command_id": lidarr_command_id,
+            "imported_count": imported_count,
+        }
+        if rejections is not None:
+            doc["rejections"] = list(rejections)
         with self._flock():
-            self._orphans.upsert(
-                {
-                    "folder_path": folder_path,
-                    "scanned_at": _now(),
-                    "status": status,
-                    "matched_album_id": matched_album_id,
-                    "lidarr_command_id": lidarr_command_id,
-                    "imported_count": imported_count,
-                },
-                Q.folder_path == folder_path,
-            )
+            self._orphans.upsert(doc, Q.folder_path == folder_path)
 
     def get_orphan(self, folder_path: str) -> dict:
         Q = Query()

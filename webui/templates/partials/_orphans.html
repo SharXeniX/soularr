@@ -1,0 +1,41 @@
+<div id="view-orphans" class="view">
+    <div class="page-toolbar">
+        <button class="toolbar-btn" onclick="loadOrphans()">Refresh</button>
+        <select id="orphan-filter" class="toolbar-btn" onchange="loadOrphans()">
+            <option value="all">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="partial_imported">Partial imported</option>
+            <option value="no_match">No match</option>
+            <option value="error">Error</option>
+            <option value="ignored">Ignored</option>
+            <option value="empty">Empty</option>
+        </select>
+        <span id="orphans-count" class="toolbar-meta"></span>
+    </div>
+    <div class="data-table-wrap">
+        <table class="data-table" id="orphans-table">
+            <thead>
+                <tr>
+                    <th>Folder</th>
+                    <th>Artist</th>
+                    <th>Album</th>
+                    <th>Audio files</th>
+                    <th>Rejections</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="orphans-body"></tbody>
+        </table>
+        <div id="orphans-empty" class="data-table-empty hidden">No orphans.</div>
+    </div>
+
+    <div id="orphan-detail-modal" class="orphan-modal hidden">
+        <div class="orphan-modal-content">
+            <div class="orphan-modal-header">
+                <span id="orphan-modal-title"></span>
+                <button class="toolbar-btn" onclick="closeOrphanModal()">Close</button>
+            </div>
+            <div id="orphan-modal-body"></div>
+        </div>
+    </div>
+</div>

@@ -30,10 +30,9 @@ from typing import Optional
 import music_tag
 
 from state import State
+from audio import is_audio, list_audio
 
 logger = logging.getLogger("orphans")
-
-AUDIO_EXTS = (".flac", ".mp3", ".m4a", ".ogg", ".opus")
 
 # Folders under the downloads dir that should never be treated as orphans.
 SKIP_FOLDER_PREFIXES = ("failed_imports", ".incomplete", ".")
@@ -51,7 +50,7 @@ def _first_audio_file(folder_path: str) -> Optional[str]:
     except OSError:
         return None
     for name in names:
-        if name.lower().endswith(AUDIO_EXTS):
+        if is_audio(name):
             return os.path.join(folder_path, name)
     return None
 
@@ -188,37 +187,47 @@ def _parse_imported_count(message: str) -> int:
     return 0
 
 
-def _manual_import(lidarr, folder_path_lidarr: str) -> tuple:
+def fetch_lidarr_preview(lidarr, folder_path_lidarr: str) -> list:
+    """
+    Return Lidarr's manualimport preview for the given folder. Each entry is a
+    candidate file with `rejections`, `album`, `artist`, `quality`, etc.
+    """
+    import requests
+    # pyarr's LidarrAPI stores the host url as `host_url` in newer versions.
+    url = getattr(lidarr, "host_url", None) or getattr(lidarr, "_session_url", "")
+    api_key = getattr(lidarr, "api_key", None) or getattr(lidarr, "_session_api_key", "")
+    r = requests.get(
+        f"{url.rstrip('/')}/api/v1/manualimport",
+        params={"folder": folder_path_lidarr},
+        headers={"X-Api-Key": api_key},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def unique_rejections(preview: list) -> list:
+    """Collapse the per-file rejections in the preview into a sorted unique list."""
+    seen = set()
+    for f in preview:
+        for r in f.get("rejections", []):
+            reason = r.get("reason") if isinstance(r, dict) else r
+            if reason:
+                seen.add(reason)
+    return sorted(seen)
+
+
+def _manual_import(lidarr, folder_path_lidarr: str, preview: list = None) -> tuple:
     """
     Use Lidarr's ManualImport flow which actually imports unattached files
     (DownloadedAlbumsScan needs a download-client tracking entry and silently
     refuses without one). Returns (command_id, candidate_count, accepted_count).
     """
-    candidates = lidarr.request_get(
-        f"manualimport?folder={folder_path_lidarr}"
-    ) if hasattr(lidarr, "request_get") else None
-    if candidates is None:
-        # pyarr exposes manual import via raw HTTP; fall back to lidarr._session
-        import urllib.parse
-        url = (
-            lidarr._session_url if hasattr(lidarr, "_session_url") else lidarr.host_url
-        )
-        api_key = (
-            lidarr._session_api_key if hasattr(lidarr, "_session_api_key") else lidarr.api_key
-        )
-        # Use the underlying session if pyarr exposes one; otherwise build a request
-        import requests
-        r = requests.get(
-            f"{url.rstrip('/')}/api/v1/manualimport",
-            params={"folder": folder_path_lidarr},
-            headers={"X-Api-Key": api_key},
-            timeout=30,
-        )
-        r.raise_for_status()
-        candidates = r.json()
+    if preview is None:
+        preview = fetch_lidarr_preview(lidarr, folder_path_lidarr)
 
     accepted = []
-    for it in candidates:
+    for it in preview:
         if it.get("rejections"):
             continue
         if not it.get("album") or not it.get("artist"):
@@ -234,7 +243,7 @@ def _manual_import(lidarr, folder_path_lidarr: str) -> tuple:
         })
 
     if not accepted:
-        return (None, len(candidates), 0)
+        return (None, len(preview), 0)
 
     cmd = lidarr.post_command(
         name="ManualImport",
@@ -242,7 +251,7 @@ def _manual_import(lidarr, folder_path_lidarr: str) -> tuple:
         importMode="auto",
         replaceExistingFiles=False,
     )
-    return (cmd.get("id"), len(candidates), len(accepted))
+    return (cmd.get("id"), len(preview), len(accepted))
 
 
 def find_orphan_folders(downloads_dir: str, state: State) -> list:
@@ -310,13 +319,7 @@ def fetch_wanted_album_ids(lidarr) -> set:
 
 
 def _audio_files_in(folder_path: str) -> list:
-    try:
-        return [
-            n for n in os.listdir(folder_path)
-            if n.lower().endswith(AUDIO_EXTS)
-        ]
-    except OSError:
-        return []
+    return list_audio(folder_path)
 
 
 def process_orphan(
@@ -348,12 +351,24 @@ def process_orphan(
         metadata, lidarr, artist_match_ratio, album_match_ratio
     )
 
+    # Always fetch Lidarr's manualimport preview so we can store the rejection
+    # reasons regardless of whether we end up auto-importing — it gives the
+    # user useful 'why is this here' info in the orphans UI.
+    lidarr_path = _to_lidarr_path(folder_path, soularr_downloads_dir, lidarr_downloads_dir)
+    try:
+        preview = fetch_lidarr_preview(lidarr, lidarr_path)
+    except Exception:
+        logger.warning(f"Orphan: preview fetch failed for {folder_path}", exc_info=True)
+        preview = []
+    rejections = unique_rejections(preview)
+
     if not matched_id or matched_id not in wanted_album_ids:
         # Not in the user's current wanted list — record for UI review and stop.
         state.mark_orphan_scanned(
             folder_path,
             status=State.ORPHAN_STATUS_PENDING,
             matched_album_id=matched_id,
+            rejections=rejections,
         )
         logger.info(
             f"Orphan {folder_path} -> pending "
@@ -367,15 +382,17 @@ def process_orphan(
         f"Orphan {folder_path} matches wanted album_id={matched_id} "
         f"(artist='{metadata['artist']}' album='{metadata['album']}'). Auto-importing."
     )
-    lidarr_path = _to_lidarr_path(folder_path, soularr_downloads_dir, lidarr_downloads_dir)
     try:
-        command_id, candidate_count, accepted_count = _manual_import(lidarr, lidarr_path)
+        command_id, candidate_count, accepted_count = _manual_import(
+            lidarr, lidarr_path, preview=preview
+        )
     except Exception:
         logger.exception(f"Orphan: failed to enqueue Lidarr ManualImport for {folder_path}")
         state.mark_orphan_scanned(
             folder_path,
             status=State.ORPHAN_STATUS_ERROR,
             matched_album_id=matched_id,
+            rejections=rejections,
         )
         return State.ORPHAN_STATUS_ERROR
 
@@ -385,6 +402,7 @@ def process_orphan(
             status=State.ORPHAN_STATUS_NO_MATCH,
             matched_album_id=matched_id,
             imported_count=0,
+            rejections=rejections,
         )
         logger.info(
             f"Orphan {folder_path} -> no_match "
@@ -401,6 +419,7 @@ def process_orphan(
             status=State.ORPHAN_STATUS_ERROR,
             matched_album_id=matched_id,
             lidarr_command_id=command_id,
+            rejections=rejections,
         )
         logger.warning(f"Orphan {folder_path} -> error (Lidarr command timeout)")
         return State.ORPHAN_STATUS_ERROR
@@ -428,6 +447,7 @@ def process_orphan(
         matched_album_id=matched_id,
         lidarr_command_id=command_id,
         imported_count=0,
+        rejections=rejections,
     )
     logger.info(f"Orphan {folder_path} -> no_match (command completed but 0 imported)")
     return State.ORPHAN_STATUS_NO_MATCH

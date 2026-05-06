@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from state import State
 import orphans as orphans_mod
+from audio import count_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +71,10 @@ def serve_static(filename):
 
 
 @app.route("/")
+@app.route("/logs")
+@app.route("/failed-imports")
+@app.route("/orphans")
+@app.route("/settings")
 def index():
     return render_template("index.html")
 
@@ -134,6 +139,39 @@ def stream():
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
+
+@app.route("/api/log/clear", methods=["POST"])
+def clear_log():
+    """
+    Backup the current log to a timestamped .bak file then truncate the live
+    log so the file on disk is genuinely cleared. Soularr's RotatingFileHandler
+    opens the file in 'a' mode (POSIX O_APPEND), so subsequent writes seek to
+    the current EOF on each call — truncating from the outside is safe and
+    new entries pick up at offset 0 of the now-empty file.
+    """
+    log_path = get_log_path(get_var_dir())
+    if not os.path.exists(log_path):
+        return jsonify({"ok": True, "message": "Log file does not exist"})
+
+    backup_path = f"{log_path}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.bak"
+    try:
+        shutil.copy2(log_path, backup_path)
+    except Exception as e:
+        logger.exception("Log clear: backup failed")
+        return jsonify({"error": f"Backup failed: {e}"}), 500
+
+    try:
+        # Open in 'w' to truncate, immediately close. Soularr's open fd is
+        # untouched — its next write appends to the now-empty file.
+        with open(log_path, "w"):
+            pass
+    except Exception as e:
+        logger.exception("Log clear: truncate failed")
+        return jsonify({"error": f"Truncate failed: {e}"}), 500
+
+    logger.info(f"Log cleared (backup at {backup_path})")
+    return jsonify({"ok": True, "backup": backup_path})
+
 def _get_state():
     return State(get_var_dir())
 
@@ -191,16 +229,7 @@ def delete_failed_import(album_id):
 # Phase 2c — orphan management endpoints
 # ----------------------------------------------------------------------------
 
-AUDIO_EXTS = (".flac", ".mp3", ".m4a", ".ogg", ".opus")
-
-
-def _audio_count(folder_path: str) -> int:
-    try:
-        return sum(
-            1 for n in os.listdir(folder_path) if n.lower().endswith(AUDIO_EXTS)
-        )
-    except OSError:
-        return 0
+_audio_count = count_audio  # back-compat alias used below
 
 
 @app.route("/api/orphans", methods=["GET"])
@@ -217,28 +246,60 @@ def list_orphans():
             it["folder_exists"] = os.path.isdir(path)
             it["audio_file_count"] = _audio_count(path) if it["folder_exists"] else 0
 
-        # Enrich with Lidarr album metadata (artist, title, year). Query each unique
-        # album_id once to avoid hammering Lidarr when several orphans match the
-        # same album.
+        # Enrich with Lidarr album metadata (artist, title, year) and the
+        # current trackfile quality summary so the UI can show "already in lib"
+        # context. Query each unique album_id once.
         unique_ids = {it.get("matched_album_id") for it in items if it.get("matched_album_id")}
         album_meta = {}
         if unique_ids:
             try:
                 lidarr = _get_lidarr()
+                import requests as _r
                 for aid in unique_ids:
                     try:
                         a = lidarr.get_album(aid)
-                        # pyarr returns a dict for a single id and a list for multiple
                         if isinstance(a, list):
                             a = a[0] if a else None
                         if not a:
                             continue
                         artist_name = (a.get("artist") or {}).get("artistName") or ""
                         year = (a.get("releaseDate") or "")[:4]
+                        stats = a.get("statistics") or {}
+                        total_tracks = stats.get("totalTrackCount", 0)
+                        track_file_count = stats.get("trackFileCount", 0)
+
+                        # Quality summary from existing trackfiles, if any.
+                        existing_qualities = []
+                        if track_file_count > 0:
+                            try:
+                                cfg = _read_config()
+                                url = cfg["Lidarr"]["host_url"].rstrip("/")
+                                tf = _r.get(
+                                    f"{url}/api/v1/trackfile",
+                                    params={"albumId": aid},
+                                    headers={"X-Api-Key": cfg["Lidarr"]["api_key"]},
+                                    timeout=15,
+                                )
+                                tf.raise_for_status()
+                                qnames = []
+                                for f in tf.json() or []:
+                                    q = (f.get("quality") or {}).get("quality") or {}
+                                    name = q.get("name")
+                                    if name:
+                                        qnames.append(name)
+                                # Distinct ordered by frequency
+                                from collections import Counter
+                                existing_qualities = [q for q, _ in Counter(qnames).most_common()]
+                            except Exception:
+                                pass
+
                         album_meta[aid] = {
                             "artist": artist_name,
                             "title": a.get("title") or "",
                             "year": year,
+                            "total_tracks": total_tracks,
+                            "track_file_count": track_file_count,
+                            "existing_qualities": existing_qualities,
                         }
                     except Exception:
                         continue
@@ -251,6 +312,9 @@ def list_orphans():
             it["artist"] = meta["artist"] if meta else ""
             it["album_title"] = meta["title"] if meta else ""
             it["year"] = meta["year"] if meta else ""
+            it["total_tracks"] = meta["total_tracks"] if meta else 0
+            it["track_file_count"] = meta["track_file_count"] if meta else 0
+            it["existing_qualities"] = meta["existing_qualities"] if meta else []
 
         return jsonify(items)
     except Exception as e:

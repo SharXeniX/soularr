@@ -1,0 +1,19 @@
+<div id="view-failed-imports" class="view">
+    <div class="page-toolbar">
+        <button class="toolbar-btn" onclick="loadFailedImports()">Refresh</button>
+        <span id="failed-imports-count" class="toolbar-meta"></span>
+    </div>
+    <div class="data-table-wrap">
+        <table class="data-table failed-imports-table">
+            <thead>
+                <tr>
+                    <th>Artist</th>
+                    <th>Album</th>
+                    <th>Failed At</th>
+                </tr>
+            </thead>
+            <tbody id="failed-imports-body"></tbody>
+        </table>
+        <div id="failed-imports-empty" class="data-table-empty hidden">No failed imports.</div>
+    </div>
+</div>
