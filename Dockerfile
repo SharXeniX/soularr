@@ -2,7 +2,7 @@ FROM python:3.11
 
 WORKDIR /app
 
-COPY requirements.txt soularr.py run.sh .
+COPY requirements.txt soularr.py state.py run.sh .
 COPY webui/ webui/
 COPY resources/ resources/
 

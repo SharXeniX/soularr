@@ -1,2 +1,5 @@
 /.venv
 /testing
+__pycache__/
+*.pyc
+*.pyo
