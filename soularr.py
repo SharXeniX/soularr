@@ -1026,15 +1026,15 @@ def monitor_downloads(grab_list, failed_grab):
                     if album_id not in grab_list:
                         break
                     logger.debug(f"Checking {file['filename']}")
-                    state = file["status"]["state"]
-                    if state in ("Completed, Cancelled", "Completed, TimedOut", "Completed, Errored", "Completed, Aborted"):
+                    file_state = file["status"]["state"]
+                    if file_state in ("Completed, Cancelled", "Completed, TimedOut", "Completed, Errored", "Completed, Aborted"):
                         if handle_hard_error(album_id, file, problems):
                             break
-                    elif state == "Completed, Rejected":
+                    elif file_state == "Completed, Rejected":
                         if handle_rejected(album_id, file, problems):
                             break
                     else:
-                        logger.error(f"Unexpected file state in problem list: {state}")
+                        logger.error(f"Unexpected file state in problem list: {file_state}")
 
         if not grab_list:
             break
