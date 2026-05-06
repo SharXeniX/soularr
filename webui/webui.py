@@ -344,21 +344,18 @@ def import_orphan():
         # Wait for the command and report imported count.
         result = orphans_mod._wait_for_command(lidarr, cmd["id"], timeout=60)
         imported = orphans_mod._parse_imported_count(result.get("message", ""))
-        # If folder is now audio-empty, clean residuals and drop the orphan entry.
+        # If anything imported, the folder is considered done — rmtree it entirely
+        # (covers residual audio Lidarr didn't accept, covers, .nfo, etc.) and
+        # drop the orphan entry. If nothing imported, leave the folder as-is so
+        # the user can retry with `force` or take other action.
         state = _get_state()
-        if imported > 0 and _audio_count(folder) == 0 and os.path.isdir(folder):
-            try:
-                shutil.rmtree(folder)
-            except OSError:
-                logger.warning(f"rmtree failed for {folder}", exc_info=True)
+        if imported > 0:
+            if os.path.isdir(folder):
+                try:
+                    shutil.rmtree(folder)
+                except OSError:
+                    logger.warning(f"rmtree failed for {folder}", exc_info=True)
             state.remove_orphan(folder)
-        elif imported > 0:
-            state.mark_orphan_scanned(
-                folder,
-                status=State.ORPHAN_STATUS_PARTIAL_IMPORTED,
-                lidarr_command_id=cmd["id"],
-                imported_count=imported,
-            )
         else:
             state.mark_orphan_scanned(
                 folder,

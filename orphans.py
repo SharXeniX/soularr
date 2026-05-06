@@ -405,37 +405,22 @@ def process_orphan(
         logger.warning(f"Orphan {folder_path} -> error (Lidarr command timeout)")
         return State.ORPHAN_STATUS_ERROR
 
-    # Lidarr move-imported the audio files. Verify the folder is audio-empty
-    # then delete the residual non-audio detritus (covers, .nfo) to keep
-    # /downloads tidy. If audio remains, treat as partial.
-    leftover_audio = _audio_files_in(folder_path)
-    if not leftover_audio and imported > 0:
+    # If anything imported, the folder is considered done. Lidarr already moved
+    # the matching audio files to the library; we rmtree the source folder
+    # entirely (residual audio, covers, .nfo) and drop the orphan entry.
+    if imported > 0:
         try:
             shutil.rmtree(folder_path)
             logger.info(
-                f"Orphan {folder_path} -> imported {imported} files, source folder cleaned up"
+                f"Orphan {folder_path} -> imported {imported} files, source folder removed"
             )
         except OSError:
             logger.warning(
-                f"Orphan {folder_path}: imported {imported} but could not rmtree residuals",
+                f"Orphan {folder_path}: imported {imported} but rmtree failed",
                 exc_info=True,
             )
         state.remove_orphan(folder_path)
         return "auto_imported"  # not a stored status — folder is gone
-
-    if imported > 0:
-        state.mark_orphan_scanned(
-            folder_path,
-            status=State.ORPHAN_STATUS_PARTIAL_IMPORTED,
-            matched_album_id=matched_id,
-            lidarr_command_id=command_id,
-            imported_count=imported,
-        )
-        logger.info(
-            f"Orphan {folder_path} -> partial_imported "
-            f"({imported} imported, {len(leftover_audio)} audio files remain)"
-        )
-        return State.ORPHAN_STATUS_PARTIAL_IMPORTED
 
     state.mark_orphan_scanned(
         folder_path,
