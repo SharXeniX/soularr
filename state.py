@@ -275,20 +275,29 @@ class State:
     # ------------------------------------------------------------------
     # Orphans — Phase 2b
     # ------------------------------------------------------------------
-    # Status values written into the orphans table:
-    ORPHAN_STATUS_IMPORTED = "imported"      # Lidarr accepted >= 1 file
-    ORPHAN_STATUS_NO_MATCH = "no_match"      # scan ran, 0 imported
-    ORPHAN_STATUS_ERROR = "error"            # command failed / timed out
-    ORPHAN_STATUS_EMPTY = "empty"            # no audio file in folder
+    # Status values written into the orphans table.
+    # Auto-import success is NOT recorded — the folder is deleted afterwards so
+    # there is nothing to track. Anything else either awaits user action via the
+    # orphans UI page or is already at a terminal state.
+    ORPHAN_STATUS_PENDING = "pending"            # detected, not in wanted list — awaits UI action
+    ORPHAN_STATUS_PARTIAL_IMPORTED = "partial_imported"  # auto-imported some, but residual audio remains
+    ORPHAN_STATUS_NO_MATCH = "no_match"          # was wanted but Lidarr rejected every file
+    ORPHAN_STATUS_ERROR = "error"                # ManualImport command failed / timed out
+    ORPHAN_STATUS_EMPTY = "empty"                # no audio file in folder
+    ORPHAN_STATUS_IGNORED = "ignored"            # user opted out via UI
+    ORPHAN_STATUS_DELETED = "deleted"            # user deleted folder via UI (audit trail)
 
-    # An orphan is "resolved" once it has been processed at least once with a
-    # terminal status. We don't retry resolved orphans automatically; the user
-    # can clear the entry to force a re-scan.
+    # Pending orphans are RE-EVALUATED on every scan because the wanted list is
+    # mutable: an album the user adds or re-monitors should auto-import the next
+    # time we see its folder. Everything else is terminal until the user clears
+    # the entry from the UI.
     _ORPHAN_TERMINAL_STATUSES = {
-        ORPHAN_STATUS_IMPORTED,
+        ORPHAN_STATUS_PARTIAL_IMPORTED,
         ORPHAN_STATUS_NO_MATCH,
         ORPHAN_STATUS_ERROR,
         ORPHAN_STATUS_EMPTY,
+        ORPHAN_STATUS_IGNORED,
+        ORPHAN_STATUS_DELETED,
     }
 
     def is_orphan_resolved(self, folder_path: str) -> bool:
@@ -327,3 +336,9 @@ class State:
     def list_orphans(self) -> list:
         with self._tlock:
             return self._orphans.all()
+
+    def remove_orphan(self, folder_path: str):
+        """Drop an orphan entry entirely (used after a fully successful auto-import)."""
+        Q = Query()
+        with self._flock():
+            self._orphans.remove(Q.folder_path == folder_path)

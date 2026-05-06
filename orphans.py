@@ -23,6 +23,7 @@ import difflib
 import logging
 import os
 import re
+import shutil
 import time
 from typing import Optional
 
@@ -245,7 +246,14 @@ def _manual_import(lidarr, folder_path_lidarr: str) -> tuple:
 
 
 def find_orphan_folders(downloads_dir: str, state: State) -> list:
-    """Return absolute paths of unresolved, untracked subfolders of downloads_dir."""
+    """
+    Return absolute paths of subfolders of `downloads_dir` that need evaluation.
+
+    A folder is included when it is not currently tracked by an in-flight slskd
+    grab and does not already carry a terminal status in the orphans table.
+    Pending entries are NOT skipped — they get re-evaluated each cycle so that
+    folders matching newly wanted albums get auto-imported on the next scan.
+    """
     try:
         entries = sorted(os.listdir(downloads_dir))
     except OSError:
@@ -267,32 +275,98 @@ def find_orphan_folders(downloads_dir: str, state: State) -> list:
     return candidates
 
 
+def fetch_wanted_album_ids(lidarr) -> set:
+    """
+    Return the set of Lidarr album ids that are currently wanted (missing or
+    cutoff_unmet). We page through both endpoints because they don't return
+    the full list in one call by default.
+    """
+    wanted: set = set()
+    for missing_flag in (True, False):
+        page = 1
+        while True:
+            try:
+                resp = lidarr.get_wanted(
+                    page=page,
+                    page_size=200,
+                    sort_dir="ascending",
+                    sort_key="albums.title",
+                    missing=missing_flag,
+                )
+            except Exception:
+                logger.warning(
+                    f"Could not fetch wanted/{('missing' if missing_flag else 'cutoff')} page {page}",
+                    exc_info=True,
+                )
+                break
+            for rec in resp.get("records", []):
+                if rec.get("id"):
+                    wanted.add(rec["id"])
+            total = resp.get("totalRecords", 0)
+            if page * 200 >= total:
+                break
+            page += 1
+    return wanted
+
+
+def _audio_files_in(folder_path: str) -> list:
+    try:
+        return [
+            n for n in os.listdir(folder_path)
+            if n.lower().endswith(AUDIO_EXTS)
+        ]
+    except OSError:
+        return []
+
+
 def process_orphan(
     folder_path: str,
     state: State,
     lidarr,
+    wanted_album_ids: set,
     soularr_downloads_dir: str,
     lidarr_downloads_dir: str,
     artist_match_ratio: float,
     album_match_ratio: float,
     command_timeout: int = 60,
 ) -> str:
-    """Process one orphan folder end-to-end. Returns the status string written to state."""
+    """
+    Process one orphan folder.
+
+    Auto-import is attempted ONLY when the fuzzy-matched album is currently in
+    Lidarr's wanted list (missing or cutoff_unmet). For everything else the
+    orphan is recorded with status `pending` and surfaced through the orphans
+    UI for manual user action.
+    """
     metadata = read_album_metadata(folder_path)
     if not metadata:
-        logger.info(f"Orphan: no readable audio metadata in {folder_path}")
+        logger.info(f"Orphan: no audio metadata readable in {folder_path}")
         state.mark_orphan_scanned(folder_path, status=State.ORPHAN_STATUS_EMPTY)
         return State.ORPHAN_STATUS_EMPTY
-
-    logger.info(
-        f"Orphan candidate: {folder_path} "
-        f"(artist='{metadata['artist']}' album='{metadata['album']}')"
-    )
 
     matched_id = find_lidarr_album_id(
         metadata, lidarr, artist_match_ratio, album_match_ratio
     )
 
+    if not matched_id or matched_id not in wanted_album_ids:
+        # Not in the user's current wanted list — record for UI review and stop.
+        state.mark_orphan_scanned(
+            folder_path,
+            status=State.ORPHAN_STATUS_PENDING,
+            matched_album_id=matched_id,
+        )
+        logger.info(
+            f"Orphan {folder_path} -> pending "
+            f"(artist='{metadata['artist']}' album='{metadata['album']}' "
+            f"matched_album_id={matched_id})"
+        )
+        return State.ORPHAN_STATUS_PENDING
+
+    # Album is wanted. Try ManualImport.
+    logger.info(
+        f"Orphan {folder_path} matches wanted album_id={matched_id} "
+        f"(artist='{metadata['artist']}' album='{metadata['album']}'). Auto-importing."
+    )
     lidarr_path = _to_lidarr_path(folder_path, soularr_downloads_dir, lidarr_downloads_dir)
     try:
         command_id, candidate_count, accepted_count = _manual_import(lidarr, lidarr_path)
@@ -306,7 +380,6 @@ def process_orphan(
         return State.ORPHAN_STATUS_ERROR
 
     if accepted_count == 0:
-        # Folder had files but none survived Lidarr's matching/quality checks.
         state.mark_orphan_scanned(
             folder_path,
             status=State.ORPHAN_STATUS_NO_MATCH,
@@ -314,8 +387,8 @@ def process_orphan(
             imported_count=0,
         )
         logger.info(
-            f"Orphan {folder_path} -> no_match (Lidarr accepted 0 of "
-            f"{candidate_count} candidates)"
+            f"Orphan {folder_path} -> no_match "
+            f"(Lidarr rejected all {candidate_count} candidates)"
         )
         return State.ORPHAN_STATUS_NO_MATCH
 
@@ -323,24 +396,56 @@ def process_orphan(
     imported = _parse_imported_count(result.get("message", ""))
 
     if result.get("status") == "timeout":
-        status = State.ORPHAN_STATUS_ERROR
-    elif imported > 0:
-        status = State.ORPHAN_STATUS_IMPORTED
-    else:
-        status = State.ORPHAN_STATUS_NO_MATCH
+        state.mark_orphan_scanned(
+            folder_path,
+            status=State.ORPHAN_STATUS_ERROR,
+            matched_album_id=matched_id,
+            lidarr_command_id=command_id,
+        )
+        logger.warning(f"Orphan {folder_path} -> error (Lidarr command timeout)")
+        return State.ORPHAN_STATUS_ERROR
+
+    # Lidarr move-imported the audio files. Verify the folder is audio-empty
+    # then delete the residual non-audio detritus (covers, .nfo) to keep
+    # /downloads tidy. If audio remains, treat as partial.
+    leftover_audio = _audio_files_in(folder_path)
+    if not leftover_audio and imported > 0:
+        try:
+            shutil.rmtree(folder_path)
+            logger.info(
+                f"Orphan {folder_path} -> imported {imported} files, source folder cleaned up"
+            )
+        except OSError:
+            logger.warning(
+                f"Orphan {folder_path}: imported {imported} but could not rmtree residuals",
+                exc_info=True,
+            )
+        state.remove_orphan(folder_path)
+        return "auto_imported"  # not a stored status — folder is gone
+
+    if imported > 0:
+        state.mark_orphan_scanned(
+            folder_path,
+            status=State.ORPHAN_STATUS_PARTIAL_IMPORTED,
+            matched_album_id=matched_id,
+            lidarr_command_id=command_id,
+            imported_count=imported,
+        )
+        logger.info(
+            f"Orphan {folder_path} -> partial_imported "
+            f"({imported} imported, {len(leftover_audio)} audio files remain)"
+        )
+        return State.ORPHAN_STATUS_PARTIAL_IMPORTED
 
     state.mark_orphan_scanned(
         folder_path,
-        status=status,
+        status=State.ORPHAN_STATUS_NO_MATCH,
         matched_album_id=matched_id,
         lidarr_command_id=command_id,
-        imported_count=imported,
+        imported_count=0,
     )
-    logger.info(
-        f"Orphan {folder_path} -> status={status} imported={imported}/{accepted_count} "
-        f"album_id={matched_id} cmd_id={command_id}"
-    )
-    return status
+    logger.info(f"Orphan {folder_path} -> no_match (command completed but 0 imported)")
+    return State.ORPHAN_STATUS_NO_MATCH
 
 
 def process_all_orphans(
@@ -352,17 +457,22 @@ def process_all_orphans(
     album_match_ratio: float = 0.85,
     command_timeout: int = 60,
 ) -> int:
-    """Entry point. Returns the count of folders processed this cycle."""
+    """Entry point. Returns the count of folders evaluated this cycle."""
     candidates = find_orphan_folders(soularr_downloads_dir, state)
     if not candidates:
         return 0
-    logger.info(f"Orphan scan: {len(candidates)} candidate folder(s) to process")
+    wanted_album_ids = fetch_wanted_album_ids(lidarr)
+    logger.info(
+        f"Orphan scan: {len(candidates)} candidate folder(s) "
+        f"({len(wanted_album_ids)} wanted album ids loaded)"
+    )
     for path in candidates:
         try:
             process_orphan(
                 folder_path=path,
                 state=state,
                 lidarr=lidarr,
+                wanted_album_ids=wanted_album_ids,
                 soularr_downloads_dir=soularr_downloads_dir,
                 lidarr_downloads_dir=lidarr_downloads_dir,
                 artist_match_ratio=artist_match_ratio,
