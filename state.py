@@ -181,6 +181,18 @@ class State:
         with self._tlock:
             return self._albums.search(Q.state.one_of(list(IN_FLIGHT_STATES)))
 
+    def list_albums(self) -> list:
+        with self._tlock:
+            return self._albums.all()
+
+    def in_flight_album_ids(self) -> set:
+        Q = Query()
+        with self._tlock:
+            return {
+                d["album_id"]
+                for d in self._albums.search(Q.state.one_of(list(IN_FLIGHT_STATES)))
+            }
+
     @staticmethod
     def _compute_album_state(transfers: dict) -> str:
         if not transfers:
