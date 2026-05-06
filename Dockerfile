@@ -2,7 +2,7 @@ FROM python:3.11
 
 WORKDIR /app
 
-COPY requirements.txt soularr.py state.py orphans.py audio.py adopt.py run.sh .
+COPY requirements.txt soularr.py state.py orphans.py audio.py adopt.py prepare.py run.sh .
 COPY webui/ webui/
 COPY resources/ resources/
 
