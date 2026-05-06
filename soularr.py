@@ -1495,6 +1495,14 @@ def main():
                 cmd_timeout = config.getint(
                     "Orphan Settings", "lidarr_command_timeout", fallback=60
                 )
+                prepare_options = {
+                    "enabled": config.getboolean("Prepare Settings", "enabled", fallback=True),
+                    "rewrite_tags": config.getboolean("Prepare Settings", "rewrite_tags", fallback=True),
+                    "infer_track_number_from_filename": config.getboolean(
+                        "Prepare Settings", "infer_track_number_from_filename", fallback=True
+                    ),
+                    "rename_pattern": config.get("Prepare Settings", "rename_pattern", fallback=""),
+                }
                 processed = process_all_orphans(
                     soularr_downloads_dir=slskd_download_dir,
                     lidarr_downloads_dir=lidarr_download_dir,
@@ -1503,6 +1511,7 @@ def main():
                     artist_match_ratio=artist_ratio,
                     album_match_ratio=album_ratio,
                     command_timeout=cmd_timeout,
+                    prepare_options=prepare_options,
                 )
                 if processed:
                     logger.info(f"Orphan scan: processed {processed} folder(s)")

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from state import State
 import orphans as orphans_mod
 from audio import count_audio
+from prepare import prepare_for_import
 
 logging.basicConfig(
     level=logging.INFO,
@@ -366,9 +367,31 @@ def import_orphan():
     try:
         lidarr = _get_lidarr()
         lidarr_path = _to_lidarr_path(folder)
+        cfg = _read_config()
+
+        # Optional Phase 3 prep: rewrite weak tags / rename files using the
+        # user's pattern before asking Lidarr what it can match. Look up the
+        # matched album_id from the orphan record (if any) so we know what to
+        # canonicalize against.
+        if cfg.has_section("Prepare Settings"):
+            entry = _get_state().get_orphan(folder) or {}
+            matched_album_id = entry.get("matched_album_id")
+            if matched_album_id:
+                prepare_options = {
+                    "enabled":   cfg.getboolean("Prepare Settings", "enabled", fallback=True),
+                    "rewrite_tags": cfg.getboolean("Prepare Settings", "rewrite_tags", fallback=True),
+                    "infer_track_number_from_filename": cfg.getboolean(
+                        "Prepare Settings", "infer_track_number_from_filename", fallback=True
+                    ),
+                    "rename_pattern": cfg.get("Prepare Settings", "rename_pattern", fallback=""),
+                }
+                try:
+                    prepare_for_import(folder, lidarr, matched_album_id, prepare_options)
+                except Exception:
+                    logger.warning(f"prepare step failed for {folder}", exc_info=True)
+
         # Reuse the orphans module logic but allow forcing rejected files.
         import requests as _r
-        cfg = _read_config()
         url = cfg["Lidarr"]["host_url"].rstrip("/")
         preview = _r.get(
             f"{url}/api/v1/manualimport",

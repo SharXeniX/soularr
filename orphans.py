@@ -332,6 +332,7 @@ def process_orphan(
     artist_match_ratio: float,
     album_match_ratio: float,
     command_timeout: int = 60,
+    prepare_options: dict = None,
 ) -> str:
     """
     Process one orphan folder.
@@ -382,6 +383,19 @@ def process_orphan(
         f"Orphan {folder_path} matches wanted album_id={matched_id} "
         f"(artist='{metadata['artist']}' album='{metadata['album']}'). Auto-importing."
     )
+
+    # Optional Phase 3 preparation: rewrite weak tags / rename files so Lidarr
+    # has a clean folder to import. Discard the cached preview because the
+    # rewrite changes file paths and tags.
+    if prepare_options and prepare_options.get("enabled", True):
+        try:
+            from prepare import prepare_for_import
+            result = prepare_for_import(folder_path, lidarr, matched_id, prepare_options)
+            if result and (result.get("tagged") or result.get("renamed")):
+                preview = None  # force fresh preview after files moved/retagged
+        except Exception:
+            logger.warning("Prepare step failed; continuing with original files", exc_info=True)
+
     try:
         command_id, candidate_count, accepted_count = _manual_import(
             lidarr, lidarr_path, preview=preview
@@ -461,6 +475,7 @@ def process_all_orphans(
     artist_match_ratio: float = 0.85,
     album_match_ratio: float = 0.85,
     command_timeout: int = 60,
+    prepare_options: dict = None,
 ) -> int:
     """Entry point. Returns the count of folders evaluated this cycle."""
     candidates = find_orphan_folders(soularr_downloads_dir, state)
@@ -483,6 +498,7 @@ def process_all_orphans(
                 artist_match_ratio=artist_match_ratio,
                 album_match_ratio=album_match_ratio,
                 command_timeout=command_timeout,
+                prepare_options=prepare_options,
             )
         except Exception:
             logger.exception(f"Unhandled error while processing orphan {path}")
