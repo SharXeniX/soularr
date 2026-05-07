@@ -38,11 +38,23 @@ def is_audio(name: str) -> bool:
 
 
 def list_audio(folder_path: str) -> list:
-    """Return audio filenames in `folder_path` (non-recursive)."""
+    """Return audio file paths under `folder_path`, walked recursively.
+
+    Paths are returned relative to `folder_path` so callers can preserve the
+    nested layout (e.g. "The Way It Ends (2020)/01 - Never There.flac").
+    Some Soulseek peers share albums one level deep inside the leaf folder,
+    and a non-recursive listing would miss every track in those layouts.
+    """
+    results: list = []
     try:
-        return [n for n in os.listdir(folder_path) if is_audio(n)]
+        for dirpath, _dirnames, filenames in os.walk(folder_path):
+            for name in filenames:
+                if is_audio(name):
+                    full = os.path.join(dirpath, name)
+                    results.append(os.path.relpath(full, folder_path))
     except OSError:
         return []
+    return results
 
 
 def count_audio(folder_path: str) -> int:

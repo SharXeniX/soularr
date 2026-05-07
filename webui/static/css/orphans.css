@@ -13,6 +13,27 @@
 .orphan-clickable { cursor: pointer; }
 .orphan-clickable:hover { text-decoration: underline; }
 
+.orphan-status {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 6px;
+    vertical-align: middle;
+    color: #d4d4d4;
+    background: #404040;
+}
+.orphan-status-pending          { background: #5a4a1a; color: #f0d080; }
+.orphan-status-downloading      { background: #1a3a5a; color: #80c0f0; }
+.orphan-status-no_match         { background: #5a1a30; color: #f08090; }
+.orphan-status-error            { background: #5a1a1a; color: #f08080; }
+.orphan-status-partial_imported { background: #3a5a1a; color: #a0e070; }
+.orphan-status-empty            { background: #303030; color: #888; }
+.orphan-status-ignored          { background: #303030; color: #888; }
+
 .orphan-inlib {
     font-size: 11px;
     color: #6090b0;

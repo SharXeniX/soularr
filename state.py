@@ -14,6 +14,7 @@ other.
 """
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -24,7 +25,7 @@ from tinydb import Query, TinyDB
 
 DB_FILENAME = "soularr.db.json"
 LOCK_FILENAME = "soularr.db.lock"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # Album-level states
@@ -37,6 +38,12 @@ STATE_ABANDONED = "abandoned"
 
 IN_FLIGHT_STATES = {STATE_QUEUED, STATE_DOWNLOADING, STATE_PARTIAL}
 TERMINAL_STATES = {STATE_SUCCEEDED, STATE_FAILED, STATE_ABANDONED}
+
+# Albums that should still be considered "owned" by soularr/slskd: actively
+# transferring (IN_FLIGHT) or already on disk awaiting Lidarr import
+# (SUCCEEDED, transient until orphan auto-import or user UI action drops it).
+# Used by filter_list to avoid re-grabbing files that are already there.
+TRACKED_STATES = IN_FLIGHT_STATES | {STATE_SUCCEEDED}
 
 
 def _now() -> str:
@@ -74,54 +81,109 @@ class State:
     # ------------------------------------------------------------------
     # Migration (idempotent — runs once when schema_version is missing)
     # ------------------------------------------------------------------
+    @staticmethod
+    def legacy_orphan_id(doc: dict) -> str:
+        """Compute a stable composite id for a legacy orphan record so the v2
+        migration can give it the same shape as freshly-scanned entries.
+
+        Uses (artist, album, format) when present (post-Phase 2c records) and
+        falls back to the folder_path otherwise (pre-Phase 2c audit entries).
+        Mirrors orphans._orphan_id but lives here so state.py stays free of
+        the orphans module dependency.
+        """
+        artist = (doc.get("artist") or "").lower().strip()
+        album = (doc.get("album") or "").lower().strip()
+        fmt = doc.get("format") or ""
+        if artist and album:
+            raw = f"{artist}|{album}|{fmt}"
+        else:
+            raw = "__legacy__|" + (doc.get("folder_path") or "")
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
     def migrate_legacy(self):
         Q = Query()
         with self._flock():
-            if self._runtime.get(Q.key == "schema_version"):
-                return
+            v_doc = self._runtime.get(Q.key == "schema_version")
+            current_v = v_doc.get("value") if v_doc else 0
 
-            legacy_failed = os.path.join(self.var_dir, "failed_imports.json")
-            if os.path.exists(legacy_failed):
-                try:
-                    with open(legacy_failed) as f:
-                        data = json.load(f)
-                    for entry in data.values():
-                        self._failed.upsert(entry, Q.album_id == entry.get("album_id"))
-                    shutil.move(legacy_failed, legacy_failed + ".migrated")
-                except Exception:
-                    pass
+            if current_v < 1:
+                legacy_failed = os.path.join(self.var_dir, "failed_imports.json")
+                if os.path.exists(legacy_failed):
+                    try:
+                        with open(legacy_failed) as f:
+                            data = json.load(f)
+                        for entry in data.values():
+                            self._failed.upsert(entry, Q.album_id == entry.get("album_id"))
+                        shutil.move(legacy_failed, legacy_failed + ".migrated")
+                    except Exception:
+                        pass
 
-            # Legacy current page file (plain int, not JSON). Soularr historically uses
-            # ".current_page.txt"; tolerate the older "current_page.json" too.
-            for legacy_page in (
-                os.path.join(self.var_dir, ".current_page.txt"),
-                os.path.join(self.var_dir, "current_page.json"),
-            ):
-                if not os.path.exists(legacy_page):
-                    continue
-                try:
-                    with open(legacy_page) as f:
-                        raw = f.read().strip()
-                    page = int(raw) if raw else 1
-                    self._runtime.upsert(
-                        {"key": "current_page", "value": page},
-                        Q.key == "current_page",
-                    )
-                    shutil.move(legacy_page, legacy_page + ".migrated")
-                    break
-                except Exception:
-                    pass
+                # Legacy current page file (plain int, not JSON). Soularr historically uses
+                # ".current_page.txt"; tolerate the older "current_page.json" too.
+                for legacy_page in (
+                    os.path.join(self.var_dir, ".current_page.txt"),
+                    os.path.join(self.var_dir, "current_page.json"),
+                ):
+                    if not os.path.exists(legacy_page):
+                        continue
+                    try:
+                        with open(legacy_page) as f:
+                            raw = f.read().strip()
+                        page = int(raw) if raw else 1
+                        self._runtime.upsert(
+                            {"key": "current_page", "value": page},
+                            Q.key == "current_page",
+                        )
+                        shutil.move(legacy_page, legacy_page + ".migrated")
+                        break
+                    except Exception:
+                        pass
 
-            self._runtime.insert({"key": "schema_version", "value": SCHEMA_VERSION})
+            if current_v < 2:
+                # v2: orphan records gain a composite `id` derived from
+                # (artist, album, format) so a release is uniquely keyed
+                # regardless of where its files sit on disk.
+                #
+                # Legacy records (pre-v2) don't carry artist/album/format —
+                # they were keyed by folder_path and only stored matched_album_id
+                # plus rejections. Fresh scans will re-detect these folders and
+                # create proper composite-keyed entries, so we drop the legacy
+                # records here EXCEPT when their status reflects an explicit
+                # user decision (ignored / deleted) — those are audit records
+                # we preserve under a synthetic `__legacy__` id.
+                user_statuses = {"ignored", "deleted"}
+                for doc in list(self._orphans.all()):
+                    if doc.get("id"):
+                        continue
+                    has_metadata = bool(doc.get("artist") and doc.get("album"))
+                    is_user_choice = doc.get("status") in user_statuses
+                    if has_metadata or is_user_choice:
+                        self._orphans.update(
+                            {"id": self.legacy_orphan_id(doc)},
+                            doc_ids=[doc.doc_id],
+                        )
+                    else:
+                        self._orphans.remove(doc_ids=[doc.doc_id])
+
+            self._runtime.upsert(
+                {"key": "schema_version", "value": SCHEMA_VERSION},
+                Q.key == "schema_version",
+            )
 
     # ------------------------------------------------------------------
     # Albums — in-flight grab tracking (Phase 1+)
     # ------------------------------------------------------------------
     def is_in_flight(self, album_id: int) -> bool:
+        """True when soularr/slskd is already managing this album: actively
+        downloading OR succeeded but not yet imported. filter_list uses this
+        to avoid re-grabbing files that are on disk awaiting an orphan import
+        — a Lidarr rejection that fails the import stays SUCCEEDED until the
+        user clears it via the UI, and we don't want to start a new download
+        cycle in the meantime."""
         Q = Query()
         with self._tlock:
             doc = self._albums.get(Q.album_id == album_id)
-            return bool(doc) and doc.get("state") in IN_FLIGHT_STATES
+            return bool(doc) and doc.get("state") in TRACKED_STATES
 
     def register_grab(
         self,
@@ -186,11 +248,25 @@ class State:
             return self._albums.all()
 
     def in_flight_album_ids(self) -> set:
+        """Albums whose transfers are still active in slskd. Used by orphan
+        scan to mark on-disk files as `downloading` (don't auto-import yet —
+        monitor_downloads will handle it once everything finishes)."""
         Q = Query()
         with self._tlock:
             return {
                 d["album_id"]
                 for d in self._albums.search(Q.state.one_of(list(IN_FLIGHT_STATES)))
+            }
+
+    def tracked_album_ids(self) -> set:
+        """Superset of in_flight_album_ids that also includes SUCCEEDED — i.e.
+        any album with a state.albums entry that hasn't been cleaned up.
+        Used by adopt to avoid re-registering an album already on disk."""
+        Q = Query()
+        with self._tlock:
+            return {
+                d["album_id"]
+                for d in self._albums.search(Q.state.one_of(list(TRACKED_STATES)))
             }
 
     @staticmethod
@@ -296,6 +372,7 @@ class State:
     # there is nothing to track. Anything else either awaits user action via the
     # orphans UI page or is already at a terminal state.
     ORPHAN_STATUS_PENDING = "pending"            # detected, not in wanted list — awaits UI action
+    ORPHAN_STATUS_DOWNLOADING = "downloading"    # currently tracked by the normal soularr/slskd flow
     ORPHAN_STATUS_PARTIAL_IMPORTED = "partial_imported"  # auto-imported some, but residual audio remains
     ORPHAN_STATUS_NO_MATCH = "no_match"          # was wanted but Lidarr rejected every file
     ORPHAN_STATUS_ERROR = "error"                # ManualImport command failed / timed out
@@ -316,46 +393,90 @@ class State:
         ORPHAN_STATUS_DELETED,
     }
 
-    def is_orphan_resolved(self, folder_path: str) -> bool:
+    # Orphan statuses that mean "files are on disk and pending some action" —
+    # if any orphan record with matched_album_id == X has one of these, soularr
+    # should NOT grab a fresh copy of album X. The orphan flow (or user) will
+    # handle import; re-grabbing wastes bandwidth and creates duplicates.
+    _ORPHAN_BLOCKS_GRAB = {
+        "pending",
+        "downloading",
+        "no_match",
+        "partial_imported",
+        "error",
+    }
+
+    def has_orphan_blocking_grab(self, album_id: int) -> bool:
+        """True when an existing orphan record for this album means a fresh
+        slskd grab would be redundant. Used by filter_list."""
         Q = Query()
         with self._tlock:
-            doc = self._orphans.get(Q.folder_path == folder_path)
+            for doc in self._orphans.search(Q.matched_album_id == album_id):
+                if doc.get("status") in self._ORPHAN_BLOCKS_GRAB:
+                    return True
+        return False
+
+    def is_orphan_resolved(self, orphan_id: str) -> bool:
+        Q = Query()
+        with self._tlock:
+            doc = self._orphans.get(Q.id == orphan_id)
             return bool(doc) and doc.get("status") in self._ORPHAN_TERMINAL_STATUSES
 
     def mark_orphan_scanned(
         self,
-        folder_path: str,
-        status: str,
+        orphan_id: str,
+        folder_path: str = None,
+        status: str = None,
+        artist: str = None,
+        album: str = None,
+        album_format: str = None,
         matched_album_id: int = None,
         lidarr_command_id: int = None,
-        imported_count: int = 0,
+        imported_count: int = None,
         rejections: list = None,
     ):
-        Q = Query()
-        doc = {
-            "folder_path": folder_path,
-            "scanned_at": _now(),
-            "status": status,
-            "matched_album_id": matched_album_id,
-            "lidarr_command_id": lidarr_command_id,
-            "imported_count": imported_count,
-        }
-        if rejections is not None:
-            doc["rejections"] = list(rejections)
-        with self._flock():
-            self._orphans.upsert(doc, Q.folder_path == folder_path)
+        """
+        Upsert an orphan record. Identity is the composite `orphan_id` derived
+        from (artist, album, format) — see orphans._orphan_id. The on-disk
+        `folder_path` is stored alongside for filesystem actions but is NOT
+        the primary key, so a folder rename/move doesn't fork the entry.
 
-    def get_orphan(self, folder_path: str) -> dict:
+        Fields left as None are preserved when updating an existing record;
+        callers performing a status-only update (ignore / delete) don't need
+        to re-supply artist/album/folder_path.
+        """
+        Q = Query()
+        with self._flock():
+            existing = self._orphans.get(Q.id == orphan_id) or {}
+            doc = dict(existing)
+            doc["id"] = orphan_id
+            doc["scanned_at"] = _now()
+            for key, value in (
+                ("folder_path", folder_path),
+                ("status", status),
+                ("artist", artist),
+                ("album", album),
+                ("format", album_format),
+                ("matched_album_id", matched_album_id),
+                ("lidarr_command_id", lidarr_command_id),
+                ("imported_count", imported_count),
+            ):
+                if value is not None:
+                    doc[key] = value
+            if rejections is not None:
+                doc["rejections"] = list(rejections)
+            self._orphans.upsert(doc, Q.id == orphan_id)
+
+    def get_orphan(self, orphan_id: str) -> dict:
         Q = Query()
         with self._tlock:
-            return self._orphans.get(Q.folder_path == folder_path)
+            return self._orphans.get(Q.id == orphan_id)
 
     def list_orphans(self) -> list:
         with self._tlock:
             return self._orphans.all()
 
-    def remove_orphan(self, folder_path: str):
+    def remove_orphan(self, orphan_id: str):
         """Drop an orphan entry entirely (used after a fully successful auto-import)."""
         Q = Query()
         with self._flock():
-            self._orphans.remove(Q.folder_path == folder_path)
+            self._orphans.remove(Q.id == orphan_id)
