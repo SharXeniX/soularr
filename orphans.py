@@ -264,15 +264,18 @@ def _norm_key(s: str) -> str:
     return s
 
 
-def _orphan_id(artist: str, album: str, fmt: str, fallback_path: str = "") -> str:
+def _orphan_id(artist: str, album: str, fmt: str, scope: str = "", fallback_path: str = "") -> str:
     """
-    Composite orphan key: a stable hash of (norm_artist, norm_album, format).
-    This is the on-disk identity of a release — independent of where its files
-    live, so renaming or moving the folder doesn't fork the entry. Tag-less
-    fallback groups use the path so they stay distinct from one another.
+    Composite orphan key: a stable hash of (norm_artist, norm_album, format,
+    album-folder basename). The on-disk album-folder name disambiguates
+    case-variant duplicates that resolve to the same canonical metadata
+    (e.g. 'To Be Everywhere Is to Be Nowhere' and 'To Be Everywhere Is To Be
+    Nowhere' tags pointing at two different physical folders); without it,
+    they'd collide under one id and the LCA would collapse up to the artist
+    root, polluting the preview with files from sibling albums.
     """
     if artist and album:
-        raw = f"{_norm_key(artist)}|{_norm_key(album)}|{fmt}"
+        raw = f"{_norm_key(artist)}|{_norm_key(album)}|{fmt}|{scope}"
     else:
         raw = f"__fallback__|{fallback_path}|{fmt}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
@@ -287,6 +290,22 @@ def _format_for(file_path: str) -> str:
         return parent
     ext = os.path.splitext(file_path)[1].lower().lstrip(".")
     return ext.upper() or "UNKNOWN"
+
+
+def _scope_for(file_path: str, downloads_dir: str) -> str:
+    """Return the basename of the on-disk album folder for `file_path` —
+    the file's parent dir, climbed one level if that dir is a format bucket.
+    Empty string if the file sits directly at downloads_dir.
+
+    Used to keep two case-variant folders for the same canonical (artist,
+    album, format) tuple from being grouped together (which would collapse
+    the LCA up to the artist root)."""
+    parent = os.path.dirname(file_path)
+    if _FORMAT_BUCKET_RE.match(os.path.basename(parent)):
+        parent = os.path.dirname(parent)
+    if os.path.normpath(parent) == os.path.normpath(downloads_dir):
+        return ""
+    return os.path.basename(parent)
 
 
 def _read_album_tags(path: str) -> tuple:
@@ -306,11 +325,14 @@ def find_orphan_albums(downloads_dir: str) -> list:
     Walk `downloads_dir` and return per-(artist, album, format) orphan
     candidates.
 
-    Audio files are grouped by (norm_artist, norm_album, format), where format
-    is the slskd_hook format-bucket folder name (FLAC-24, MP3-VBR, ...) or the
-    bare extension uppercased when there is no bucket folder. Artist/album
-    keys are normalized (lowercase, whitespace collapsed, no spaces around
-    `/-:`) so 'Either / Or' and 'Either/Or' merge into one row.
+    Audio files are grouped by (norm_artist, norm_album, format, scope), where
+    format is the slskd_hook format-bucket folder name (FLAC-24, MP3-VBR, ...)
+    or the bare extension uppercased; scope is the on-disk album-folder
+    basename (parent of the format bucket). Artist/album keys are normalized
+    (lowercase, whitespace collapsed, no spaces around `/-:`) so 'Either / Or'
+    and 'Either/Or' tags merge into one row when they share an album folder;
+    scope keeps two case-variant album folders for the same canonical metadata
+    distinct so the LCA doesn't collapse up to the artist root.
 
     Files whose tags can't be read fall back to grouping by their immediate
     parent directory + format. Fallback buckets are absorbed into a tagged
@@ -325,7 +347,7 @@ def find_orphan_albums(downloads_dir: str) -> list:
     except OSError:
         return []
 
-    groups: dict = {}      # (norm_artist, norm_album, format) -> {files, metadata, format}
+    groups: dict = {}      # (norm_artist, norm_album, format, scope) -> {files, metadata, format, scope}
     fallback: dict = {}    # (parent_dir, format) -> {files, format}
 
     for top in top_entries:
@@ -341,15 +363,17 @@ def find_orphan_albums(downloads_dir: str) -> list:
                     continue
                 full = os.path.join(dirpath, name)
                 fmt = _format_for(full)
+                scope = _scope_for(full, downloads_dir)
                 artist, album, year = _read_album_tags(full)
                 if artist and album:
-                    key = (_norm_key(artist), _norm_key(album), fmt)
+                    key = (_norm_key(artist), _norm_key(album), fmt, scope)
                     g = groups.setdefault(
                         key,
                         {
                             "files": [],
                             "metadata": {"artist": artist, "album": album, "year": year},
                             "format": fmt,
+                            "scope": scope,
                         },
                     )
                     g["files"].append(full)
@@ -383,7 +407,7 @@ def find_orphan_albums(downloads_dir: str) -> list:
         folder = _common_folder(g["files"], downloads_dir)
         meta = g["metadata"]
         candidates.append({
-            "id": _orphan_id(meta["artist"], meta["album"], g["format"]),
+            "id": _orphan_id(meta["artist"], meta["album"], g["format"], g["scope"]),
             "folder_path": folder,
             "audio_files": sorted(g["files"]),
             "metadata": meta,
@@ -631,29 +655,50 @@ def process_orphan(
 _USER_STATUSES = {State.ORPHAN_STATUS_IGNORED, State.ORPHAN_STATUS_DELETED}
 
 
-def _prune_superseded(state: State, candidate_paths: list) -> None:
+def _prune_superseded(state: State, candidates: list) -> None:
     """
-    Drop orphan entries whose folder is now superseded by a deeper detected
-    album folder. Keeps the UI from showing a stale top-level row next to the
-    new per-album rows after the structure changes.
+    Drop stale orphan entries:
+      a) whose folder is now an ancestor of a deeper detected album folder
+         (e.g. the artist root being superseded by per-format children); and
+      b) whose folder_path matches a current candidate but whose id no
+         longer does — happens when the id derivation rule changes (scope
+         disambiguator added, etc.) and old records would otherwise live
+         alongside the freshly-keyed ones.
 
     `ignored` / `deleted` entries are preserved — they reflect explicit user
-    choices. Everything else (pending, no_match, error, partial_imported,
-    empty) is system-set and gets re-evaluated against the new structure.
+    choices. Everything else (pending, downloading, no_match, error,
+    partial_imported, empty) is system-set and gets re-evaluated against
+    the new structure.
     """
-    if not candidate_paths:
+    if not candidates:
         return
+    candidate_paths = [c["folder_path"] for c in candidates]
+    expected_ids_by_folder: dict = {}
+    for c in candidates:
+        expected_ids_by_folder.setdefault(c["folder_path"], set()).add(c["id"])
+
     for entry in list(state.list_orphans()):
         if entry.get("status") in _USER_STATUSES:
             continue
         old = entry.get("folder_path") or ""
+        old_id = entry.get("id") or ""
         if not old:
             continue
+        # (a) ancestor relationship
+        ancestor_drop = False
         for new in candidate_paths:
             if new != old and new.startswith(old + os.sep):
-                state.remove_orphan(entry["id"])
+                state.remove_orphan(old_id)
                 logger.info(f"Orphan {old} superseded by deeper entries; removed")
+                ancestor_drop = True
                 break
+        if ancestor_drop:
+            continue
+        # (b) same folder, mismatched id (id format change)
+        expected = expected_ids_by_folder.get(old, set())
+        if expected and old_id and old_id not in expected:
+            state.remove_orphan(old_id)
+            logger.info(f"Orphan {old} stale id {old_id} replaced; removed")
 
 
 def process_all_orphans(
@@ -670,7 +715,7 @@ def process_all_orphans(
     if not found:
         return 0
 
-    _prune_superseded(state, [c["folder_path"] for c in found])
+    _prune_superseded(state, found)
 
     # Skip already-resolved entries (terminal statuses set by previous scans
     # or explicit UI actions). Pending entries are re-evaluated each cycle so
