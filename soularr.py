@@ -409,7 +409,9 @@ def filter_list(albums):
     """
     temp_list = copy.deepcopy(albums)
 
-    # Phase 1 dedup: skip albums that already have an in-flight slskd grab tracked in State.
+    # Phase 1 dedup: skip albums that already have an in-flight slskd grab
+    # tracked in State, OR an existing orphan record (files on disk pending
+    # import). In both cases a fresh grab would be redundant.
     if state is not None:
         before = len(temp_list)
         filtered_temp = []
@@ -417,6 +419,11 @@ def filter_list(albums):
             if state.is_in_flight(album["id"]):
                 logger.info(
                     f"Skipping in-flight album: {album['artist']['artistName']} - "
+                    f"{album['title']} (ID: {album['id']})"
+                )
+            elif state.has_orphan_blocking_grab(album["id"]):
+                logger.info(
+                    f"Skipping album with on-disk orphan: {album['artist']['artistName']} - "
                     f"{album['title']} (ID: {album['id']})"
                 )
             else:
@@ -1477,47 +1484,6 @@ def main():
         slskd = slskd_api.SlskdClient(host=slskd_host_url, api_key=slskd_api_key, url_base=slskd_url_base)
         lidarr = LidarrAPI(lidarr_host_url, lidarr_api_key)
 
-        # Phase 2b — orphan recovery
-        # Look at /downloads for folders that aren't tracked nor previously resolved,
-        # try to identify the album in Lidarr, and trigger DownloadedAlbumsScan so
-        # Lidarr can import them naturally.
-        orphan_enabled = config.getboolean("Orphan Settings", "enabled", fallback=True)
-        if orphan_enabled and state is not None:
-            try:
-                from orphans import process_all_orphans
-
-                artist_ratio = config.getfloat(
-                    "Orphan Settings", "artist_name_match_ratio", fallback=0.85
-                )
-                album_ratio = config.getfloat(
-                    "Orphan Settings", "album_name_match_ratio", fallback=0.85
-                )
-                cmd_timeout = config.getint(
-                    "Orphan Settings", "lidarr_command_timeout", fallback=60
-                )
-                prepare_options = {
-                    "enabled": config.getboolean("Prepare Settings", "enabled", fallback=True),
-                    "rewrite_tags": config.getboolean("Prepare Settings", "rewrite_tags", fallback=True),
-                    "infer_track_number_from_filename": config.getboolean(
-                        "Prepare Settings", "infer_track_number_from_filename", fallback=True
-                    ),
-                    "rename_pattern": config.get("Prepare Settings", "rename_pattern", fallback=""),
-                }
-                processed = process_all_orphans(
-                    soularr_downloads_dir=slskd_download_dir,
-                    lidarr_downloads_dir=lidarr_download_dir,
-                    state=state,
-                    lidarr=lidarr,
-                    artist_match_ratio=artist_ratio,
-                    album_match_ratio=album_ratio,
-                    command_timeout=cmd_timeout,
-                    prepare_options=prepare_options,
-                )
-                if processed:
-                    logger.info(f"Orphan scan: processed {processed} folder(s)")
-            except Exception:
-                logger.exception("Orphan scan failed; continuing with normal cycle")
-
         wanted_records = []
         try:
             for source in search_sources:
@@ -1534,6 +1500,9 @@ def main():
         # follows correctly skips any album that is already being downloaded by
         # slskd (whether Soularr started it, the user grabbed it manually in
         # the slskd UI, or a prior cycle started it before our state existed).
+        # MUST run BEFORE the orphan scan so process_orphan sees fresh state
+        # (e.g. transfers that just transitioned to SUCCEEDED don't get
+        # mismarked as `downloading` when they're actually ready to import).
         adopt_enabled = config.getboolean("Adopt Settings", "enabled", fallback=True)
         if adopt_enabled and state is not None:
             try:
@@ -1555,6 +1524,39 @@ def main():
             except Exception:
                 logger.exception("Adopt sync failed; continuing with normal cycle")
 
+        # Phase 2b — orphan recovery
+        # Look at /downloads for folders that aren't tracked nor previously
+        # resolved, identify the album in Lidarr, and import via ManualImport
+        # when the album is wanted. Runs after adopt so SUCCEEDED entries are
+        # auto-imported instead of mismarked as `downloading`.
+        orphan_enabled = config.getboolean("Orphan Settings", "enabled", fallback=True)
+        if orphan_enabled and state is not None:
+            try:
+                from orphans import process_all_orphans
+
+                artist_ratio = config.getfloat(
+                    "Orphan Settings", "artist_name_match_ratio", fallback=0.85
+                )
+                album_ratio = config.getfloat(
+                    "Orphan Settings", "album_name_match_ratio", fallback=0.85
+                )
+                cmd_timeout = config.getint(
+                    "Orphan Settings", "lidarr_command_timeout", fallback=60
+                )
+                processed = process_all_orphans(
+                    soularr_downloads_dir=slskd_download_dir,
+                    lidarr_downloads_dir=lidarr_download_dir,
+                    state=state,
+                    lidarr=lidarr,
+                    artist_match_ratio=artist_ratio,
+                    album_match_ratio=album_ratio,
+                    command_timeout=cmd_timeout,
+                )
+                if processed:
+                    logger.info(f"Orphan scan: processed {processed} folder(s)")
+            except Exception:
+                logger.exception("Orphan scan failed; continuing with normal cycle")
+
         if len(wanted_records) > 0:
             try:
                 filtered = filter_list(wanted_records)
@@ -1571,10 +1573,10 @@ def main():
                 sys.exit(0)
             if failed == 0:
                 logger.info("Soularr finished. Exiting...")
-                slskd.transfers.remove_completed_downloads()
+                # slskd.transfers.remove_completed_downloads()  # disabled: keep slskd queue history visible
             else:
                 logger.info(f"{failed}: releases failed to find a match in the search results and are still wanted.")
-                slskd.transfers.remove_completed_downloads()
+                # slskd.transfers.remove_completed_downloads()  # disabled: keep slskd queue history visible
         else:
             logger.info("No releases wanted. Exiting...")
 

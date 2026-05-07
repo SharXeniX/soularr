@@ -202,9 +202,11 @@ def sync_state_with_slskd(
     _refresh_existing_state(state, by_id)
 
     # Phase 2: discover and adopt active slskd downloads that match a wanted
-    # album we don't yet track.
-    in_flight = state.in_flight_album_ids()
-    needs = [aid for aid in wanted_album_ids if aid not in in_flight]
+    # album we don't yet track. Use tracked_album_ids (broader than in-flight)
+    # so an album whose transfers all completed but Lidarr hasn't imported
+    # yet (state=SUCCEEDED) doesn't get re-adopted with fresh transfers.
+    tracked = state.tracked_album_ids()
+    needs = [aid for aid in wanted_album_ids if aid not in tracked]
     if not needs or not candidates:
         return 0
 

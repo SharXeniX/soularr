@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from state import State
 import orphans as orphans_mod
 from audio import count_audio
-from prepare import prepare_for_import
 
 logging.basicConfig(
     level=logging.INFO,
@@ -310,17 +309,39 @@ def list_orphans():
         for it in items:
             aid = it.get("matched_album_id")
             meta = album_meta.get(aid) if aid else None
-            it["artist"] = meta["artist"] if meta else ""
-            it["album_title"] = meta["title"] if meta else ""
-            it["year"] = meta["year"] if meta else ""
-            it["total_tracks"] = meta["total_tracks"] if meta else 0
-            it["track_file_count"] = meta["track_file_count"] if meta else 0
-            it["existing_qualities"] = meta["existing_qualities"] if meta else []
+            # Prefer Lidarr-canonical values when an album was matched; fall
+            # back to the ID3 tag values stored on the orphan record otherwise.
+            if meta:
+                it["artist"] = meta["artist"] or it.get("artist", "")
+                it["album_title"] = meta["title"]
+                it["year"] = meta["year"]
+                it["total_tracks"] = meta["total_tracks"]
+                it["track_file_count"] = meta["track_file_count"]
+                it["existing_qualities"] = meta["existing_qualities"]
+            else:
+                it.setdefault("artist", "")
+                it["album_title"] = it.get("album", "")
+                it["year"] = ""
+                it["total_tracks"] = 0
+                it["track_file_count"] = 0
+                it["existing_qualities"] = []
 
         return jsonify(items)
     except Exception as e:
         logger.exception("Failed to list orphans")
         return jsonify({"error": str(e)}), 500
+
+
+def _resolve_orphan(state, payload: dict):
+    """Look up an orphan record by composite id from the request payload.
+    Returns the doc dict. Raises ValueError when missing or unknown."""
+    orphan_id = (payload or {}).get("id")
+    if not orphan_id:
+        raise ValueError("id required")
+    entry = state.get_orphan(orphan_id)
+    if not entry:
+        raise ValueError(f"orphan {orphan_id} not found")
+    return entry
 
 
 @app.route("/api/orphans/preview", methods=["POST"])
@@ -330,9 +351,11 @@ def preview_orphan():
     display per-file rejections, quality, and the matched album.
     """
     data = request.get_json() or {}
-    folder = data.get("folder_path")
-    if not folder:
-        return jsonify({"error": "folder_path required"}), 400
+    try:
+        entry = _resolve_orphan(_get_state(), data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    folder = entry.get("folder_path") or ""
     try:
         import requests as _r
         cfg = _read_config()
@@ -345,7 +368,7 @@ def preview_orphan():
             timeout=30,
         )
         r.raise_for_status()
-        return jsonify({"folder_path": folder, "files": r.json()})
+        return jsonify({"id": entry["id"], "folder_path": folder, "files": r.json()})
     except Exception as e:
         logger.exception(f"Preview failed for {folder}")
         return jsonify({"error": str(e)}), 500
@@ -354,43 +377,25 @@ def preview_orphan():
 @app.route("/api/orphans/import", methods=["POST"])
 def import_orphan():
     """
-    Trigger Lidarr ManualImport on an orphan folder.
+    Trigger Lidarr ManualImport on an orphan release.
     `force=true` includes files with soft rejections (Has missing tracks, Album
     match too low, etc.); Lidarr accepts them via the explicit ManualImport
     command.
     """
     data = request.get_json() or {}
-    folder = data.get("folder_path")
+    state = _get_state()
+    try:
+        entry = _resolve_orphan(state, data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    orphan_id = entry["id"]
+    folder = entry.get("folder_path") or ""
     force = bool(data.get("force", False))
-    if not folder:
-        return jsonify({"error": "folder_path required"}), 400
     try:
         lidarr = _get_lidarr()
         lidarr_path = _to_lidarr_path(folder)
         cfg = _read_config()
 
-        # Optional Phase 3 prep: rewrite weak tags / rename files using the
-        # user's pattern before asking Lidarr what it can match. Look up the
-        # matched album_id from the orphan record (if any) so we know what to
-        # canonicalize against.
-        if cfg.has_section("Prepare Settings"):
-            entry = _get_state().get_orphan(folder) or {}
-            matched_album_id = entry.get("matched_album_id")
-            if matched_album_id:
-                prepare_options = {
-                    "enabled":   cfg.getboolean("Prepare Settings", "enabled", fallback=True),
-                    "rewrite_tags": cfg.getboolean("Prepare Settings", "rewrite_tags", fallback=True),
-                    "infer_track_number_from_filename": cfg.getboolean(
-                        "Prepare Settings", "infer_track_number_from_filename", fallback=True
-                    ),
-                    "rename_pattern": cfg.get("Prepare Settings", "rename_pattern", fallback=""),
-                }
-                try:
-                    prepare_for_import(folder, lidarr, matched_album_id, prepare_options)
-                except Exception:
-                    logger.warning(f"prepare step failed for {folder}", exc_info=True)
-
-        # Reuse the orphans module logic but allow forcing rejected files.
         import requests as _r
         url = cfg["Lidarr"]["host_url"].rstrip("/")
         preview = _r.get(
@@ -435,17 +440,23 @@ def import_orphan():
         # (covers residual audio Lidarr didn't accept, covers, .nfo, etc.) and
         # drop the orphan entry. If nothing imported, leave the folder as-is so
         # the user can retry with `force` or take other action.
-        state = _get_state()
         if imported > 0:
             if os.path.isdir(folder):
                 try:
                     shutil.rmtree(folder)
                 except OSError:
                     logger.warning(f"rmtree failed for {folder}", exc_info=True)
-            state.remove_orphan(folder)
+            state.remove_orphan(orphan_id)
+            # Also drop the state.albums tracker so filter_list doesn't keep
+            # treating the album as in-flight forever (SUCCEEDED is in
+            # TRACKED_STATES, which is correct while files are awaiting import
+            # but stale once Lidarr has moved them).
+            matched = entry.get("matched_album_id")
+            if matched:
+                state.cleanup_terminal(matched)
         else:
             state.mark_orphan_scanned(
-                folder,
+                orphan_id,
                 status=State.ORPHAN_STATUS_NO_MATCH,
                 lidarr_command_id=cmd["id"],
                 imported_count=0,
@@ -465,25 +476,50 @@ def import_orphan():
 @app.route("/api/orphans/ignore", methods=["POST"])
 def ignore_orphan():
     data = request.get_json() or {}
-    folder = data.get("folder_path")
-    if not folder:
-        return jsonify({"error": "folder_path required"}), 400
+    state = _get_state()
     try:
-        _get_state().mark_orphan_scanned(folder, status=State.ORPHAN_STATUS_IGNORED)
+        entry = _resolve_orphan(state, data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        state.mark_orphan_scanned(entry["id"], status=State.ORPHAN_STATUS_IGNORED)
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
+def _run_orphan_scan_once(state, cfg) -> int:
+    """Run a full orphan scan synchronously using the soularr-cycle settings.
+    Used by the rescan endpoint so the user sees an updated entry immediately
+    instead of waiting for the next soularr cycle."""
+    return orphans_mod.process_all_orphans(
+        soularr_downloads_dir=cfg["Slskd"]["download_dir"],
+        lidarr_downloads_dir=cfg["Lidarr"]["download_dir"],
+        state=state,
+        lidarr=_get_lidarr(),
+        artist_match_ratio=cfg.getfloat("Orphan Settings", "artist_name_match_ratio", fallback=0.85),
+        album_match_ratio=cfg.getfloat("Orphan Settings", "album_name_match_ratio", fallback=0.85),
+        command_timeout=cfg.getint("Orphan Settings", "lidarr_command_timeout", fallback=60),
+    )
+
+
 @app.route("/api/orphans/rescan", methods=["POST"])
 def rescan_orphan():
-    """Drop the entry so the next scan re-evaluates the folder from scratch."""
+    """Drop the entry and re-evaluate immediately. The folder is re-walked,
+    metadata re-read, and a fresh record is written — so the user sees the
+    updated row right away instead of waiting for the next soularr cycle."""
     data = request.get_json() or {}
-    folder = data.get("folder_path")
-    if not folder:
-        return jsonify({"error": "folder_path required"}), 400
+    state = _get_state()
     try:
-        _get_state().remove_orphan(folder)
+        entry = _resolve_orphan(state, data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        state.remove_orphan(entry["id"])
+        try:
+            _run_orphan_scan_once(state, _read_config())
+        except Exception:
+            logger.exception("Inline orphan re-scan failed; entry stays removed")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -493,17 +529,47 @@ def rescan_orphan():
 def delete_orphan():
     """Delete the orphan folder from disk and mark the entry as deleted."""
     data = request.get_json() or {}
-    folder = data.get("folder_path")
-    if not folder:
-        return jsonify({"error": "folder_path required"}), 400
+    state = _get_state()
+    try:
+        entry = _resolve_orphan(state, data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    folder = entry.get("folder_path") or ""
     try:
         if os.path.isdir(folder):
             shutil.rmtree(folder)
             logger.info(f"Deleted orphan folder: {folder}")
-        _get_state().mark_orphan_scanned(folder, status=State.ORPHAN_STATUS_DELETED)
+        state.mark_orphan_scanned(entry["id"], status=State.ORPHAN_STATUS_DELETED)
         return jsonify({"ok": True})
     except Exception as e:
         logger.exception(f"Delete failed for {folder}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/slskd-hook", methods=["POST"])
+def slskd_hook():
+    """Receive slskd's DownloadFileComplete webhook and reorganize the file
+    into the canonical {Artist}/{Album}/{Format}/{Track} - {Title}.{ext} layout."""
+    payload = request.get_json(silent=True) or {}
+    if payload.get("type") != "DownloadFileComplete":
+        return jsonify({"ok": True, "skipped": f"type={payload.get('type')}"}), 200
+
+    state = (payload.get("transfer") or {}).get("state") or ""
+    if "Succeeded" not in state:
+        return jsonify({"ok": True, "skipped": f"state={state}"}), 200
+
+    local = payload.get("localFilename")
+    if not local:
+        return jsonify({"error": "missing localFilename"}), 400
+
+    try:
+        from slskd_hook import organize
+        target = organize(local, downloads_root="/downloads")
+        if target:
+            return jsonify({"ok": True, "moved_to": target}), 200
+        return jsonify({"ok": True, "skipped": "no organize (missing tags / unreadable)"}), 200
+    except Exception as e:
+        logger.exception(f"slskd-hook organize failed for {local}")
         return jsonify({"error": str(e)}), 500
 
 

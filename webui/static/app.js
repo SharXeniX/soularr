@@ -316,17 +316,17 @@ function loadOrphans() {
             count.textContent = `${items.length} entr${items.length === 1 ? 'y' : 'ies'}`;
             items.forEach(it => {
                 const tr = document.createElement('tr');
+                const id = it.id || '';
                 const folder = it.folder_path || '';
-                const folderShort = folder.split('/').pop();
                 const label = ORPHAN_STATUS_LABEL[it.status] || it.status;
                 const audioCount = it.audio_file_count || 0;
                 const folderExists = it.folder_exists;
-                const fp = encodeURIComponent(folder);
 
                 const artist = it.artist || '—';
                 const baseAlbum = it.album_title
                     ? (it.year ? `${it.album_title} (${it.year})` : it.album_title)
                     : (it.matched_album_id ? `#${it.matched_album_id}` : '—');
+                const format = it.format || '—';
 
                 // "Already in Lidarr" annotation
                 let inLibNote = '';
@@ -343,21 +343,24 @@ function loadOrphans() {
                     : rejections.map(r => `<div class="orphan-rejection">${r}</div>`).join('');
 
                 const forceTooltip = 'Force: include files Lidarr would normally reject for soft reasons (Has missing tracks, Album match too low, quality below profile…). Hard rejections like "Already imported" are not overridden.';
+                const folderTip = `${folder} — status: ${label}`;
 
+                const statusBadge = `<span class="orphan-status orphan-status-${it.status}">${label}</span>`;
+                tr.dataset.orphanId = id;
                 tr.innerHTML = `
-                    <td><span class="orphan-folder" title="${folder} — status: ${label}">${folderShort}</span></td>
-                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${artist}</td>
-                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${baseAlbum}${inLibNote}</td>
-                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${audioCount}${folderExists ? '' : ' <em>(folder gone)</em>'}</td>
-                    <td class="orphan-clickable" onclick="previewOrphan('${fp}')" title="Click for details">${rejectionText}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${statusBadge} ${artist}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${baseAlbum}${inLibNote}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${format}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${audioCount}${folderExists ? '' : ' <em>(folder gone)</em>'}</td>
+                    <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${rejectionText}</td>
                     <td>
                         <div class="row-actions">
-                            <button class="toolbar-btn" onclick="importOrphan('${fp}', false)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
-                            <button class="toolbar-btn" title="${forceTooltip}" onclick="importOrphan('${fp}', true)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
+                            <button class="toolbar-btn" onclick="importOrphan('${id}', false, this)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
+                            <button class="toolbar-btn" title="${forceTooltip}" onclick="importOrphan('${id}', true, this)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
                             <span class="actions-divider"></span>
-                            <button class="toolbar-btn" onclick="rescanOrphan('${fp}')">Re-scan</button>
-                            <button class="toolbar-btn" onclick="ignoreOrphan('${fp}')">Ignore</button>
-                            <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${fp}')">Delete</button>
+                            <button class="toolbar-btn" onclick="rescanOrphan('${id}', this)">Re-scan</button>
+                            <button class="toolbar-btn" onclick="ignoreOrphan('${id}', this)">Ignore</button>
+                            <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${id}', this)">Delete</button>
                         </div>
                     </td>
                 `;
@@ -367,9 +370,8 @@ function loadOrphans() {
         .catch(err => console.error('loadOrphans failed', err));
 }
 
-function _orphanAction(folder_path_encoded, endpoint, body) {
-    const folder = decodeURIComponent(folder_path_encoded);
-    const payload = Object.assign({ folder_path: folder }, body || {});
+function _orphanAction(orphanId, endpoint, body) {
+    const payload = Object.assign({ id: orphanId }, body || {});
     return fetch(`/api/orphans/${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -377,13 +379,14 @@ function _orphanAction(folder_path_encoded, endpoint, body) {
     }).then(r => r.json());
 }
 
-function importOrphan(fp, force) {
-    _orphanAction(fp, 'import', { force: !!force }).then(r => {
-        const decoded = decodeURIComponent(fp);
+function importOrphan(id, force, btn) {
+    _withButtonBusy(btn, force ? 'Forcing…' : 'Importing…', () =>
+        _orphanAction(id, 'import', { force: !!force })
+    ).then(r => {
         if (r.error) {
             alert(`Import error: ${r.error}`);
         } else if (r.imported_count > 0) {
-            alert(`Imported ${r.imported_count} of ${r.accepted_count} files from ${decoded}`);
+            alert(`Imported ${r.imported_count} of ${r.accepted_count} files`);
         } else {
             alert(`No files imported. ${r.message || ''}\nTry "Force" to override soft rejections.`);
         }
@@ -391,35 +394,54 @@ function importOrphan(fp, force) {
     });
 }
 
-function ignoreOrphan(fp) {
-    _orphanAction(fp, 'ignore').then(() => loadOrphans());
+function _withButtonBusy(btn, label, fn) {
+    if (!btn) return fn();
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = label;
+    return fn().finally(() => {
+        btn.disabled = false;
+        btn.textContent = orig;
+    });
 }
 
-function rescanOrphan(fp) {
-    _orphanAction(fp, 'rescan').then(() => loadOrphans());
+function ignoreOrphan(id, btn) {
+    _withButtonBusy(btn, 'Ignoring…', () => _orphanAction(id, 'ignore'))
+        .then(() => loadOrphans());
 }
 
-function deleteOrphan(fp) {
-    if (!confirm(`Delete ${decodeURIComponent(fp)} from disk? This removes all files in the folder.`)) return;
-    _orphanAction(fp, 'delete').then(() => loadOrphans());
+function rescanOrphan(id, btn) {
+    _withButtonBusy(btn, 'Scanning…', () => _orphanAction(id, 'rescan'))
+        .then(r => {
+            if (r && r.error) alert('Re-scan failed: ' + r.error);
+            loadOrphans();
+        });
 }
 
-function previewOrphan(fp) {
-    const folder = decodeURIComponent(fp);
-    document.getElementById('orphan-modal-title').textContent = folder;
+function deleteOrphan(id, btn) {
+    if (!confirm('Delete the orphan folder from disk? This removes all files in the folder.')) return;
+    _withButtonBusy(btn, 'Deleting…', () => _orphanAction(id, 'delete'))
+        .then(() => loadOrphans());
+}
+
+function previewOrphan(id) {
     const body = document.getElementById('orphan-modal-body');
     body.innerHTML = '<em>Loading…</em>';
+    document.getElementById('orphan-modal-title').textContent = '';
     document.getElementById('orphan-detail-modal').classList.remove('hidden');
     fetch('/api/orphans/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ folder_path: folder }),
+        body: JSON.stringify({ id: id }),
     })
         .then(r => r.json())
         .then(data => {
             if (data.error) {
                 body.innerHTML = `<div class="level-error">Preview error: ${data.error}</div>`;
                 return;
+            }
+            if (data.folder_path) {
+                document.getElementById('orphan-modal-title').textContent = data.folder_path;
             }
             const files = data.files || [];
             if (files.length === 0) {

@@ -1,25 +1,33 @@
 """
 Orphan recovery for Soularr.
 
-An "orphan" is a subfolder of the slskd downloads directory that contains
-audio files but is not tracked by the State store and has not been resolved
-by a previous scan. This typically happens after Soularr restarts, after the
-user manually grabs an album in the slskd UI, or when a previous Soularr
-cycle fails to finalize an import.
+An "orphan" is an album-shaped pile of audio files inside the slskd downloads
+directory that is not currently tracked by the State store and has not been
+resolved by a previous scan. This typically happens after Soularr restarts,
+after the user manually grabs an album in the slskd UI, or when a previous
+Soularr cycle fails to finalize an import.
 
-Recovery flow (Option C — pre-match + trigger + verify):
-  1. Walk the downloads dir, list folders that aren't tracked nor resolved.
-  2. For each folder: read ID3 tags of the first audio file.
-  3. Best-effort fuzzy match the metadata against Lidarr's library to record
-     the intended album_id. The match is informational; we always trigger
-     Lidarr's scan because Lidarr's own matching is often more permissive.
-  4. POST /api/v1/command DownloadedAlbumsScan with the path Lidarr sees.
-  5. Wait for the command and parse imported_count from the result message.
-  6. Record the outcome in state.orphans so the same folder is not
+Detection groups files by their `albumartist`+`album` ID3 tags rather than
+by directory, so a download tree shaped like
+`{Artist}/{Album}/{Format}/{Track}.flac` (e.g. produced by the slskd post-
+download organizer) yields one orphan entry per album rather than one entry
+per artist with all albums merged together. The "folder" for an orphan is the
+lowest common ancestor of the files in the group.
+
+Recovery flow:
+  1. Walk the downloads dir, group audio files by (albumartist, album) tags.
+     Files without usable tags fall back to grouping by their parent dir.
+  2. For each group: best-effort fuzzy match the metadata against Lidarr.
+  3. If the matched album is currently wanted, trigger Lidarr ManualImport
+     (DownloadedAlbumsScan silently refuses without a download-client tracking
+     entry; ManualImport is what actually imports unattached files).
+  4. Wait for the command and parse imported_count from the result message.
+  5. Record the outcome in state.orphans so the same folder is not
      reprocessed on the next cycle.
 """
 
 import difflib
+import hashlib
 import logging
 import os
 import re
@@ -42,35 +50,6 @@ def _to_lidarr_path(folder_path: str, soularr_downloads_dir: str, lidarr_downloa
     """Translate a soularr-POV path into the Lidarr-POV path."""
     rel = os.path.relpath(folder_path, soularr_downloads_dir)
     return os.path.join(lidarr_downloads_dir, rel)
-
-
-def _first_audio_file(folder_path: str) -> Optional[str]:
-    try:
-        names = sorted(os.listdir(folder_path))
-    except OSError:
-        return None
-    for name in names:
-        if is_audio(name):
-            return os.path.join(folder_path, name)
-    return None
-
-
-def read_album_metadata(folder_path: str) -> Optional[dict]:
-    """Return {artist, album, year} from the first audio file's ID3 tags, or None."""
-    audio = _first_audio_file(folder_path)
-    if not audio:
-        return None
-    try:
-        f = music_tag.load_file(audio)
-        artist = str(f.get("albumartist") or f.get("artist") or "").strip()
-        album = str(f.get("album") or "").strip()
-        year = str(f.get("year") or "").strip()
-        if not artist or not album:
-            return None
-        return {"artist": artist, "album": album, "year": year}
-    except Exception:
-        logger.warning(f"Could not read tags from {audio}", exc_info=True)
-        return None
 
 
 def _ratio(a: str, b: str) -> float:
@@ -254,33 +233,194 @@ def _manual_import(lidarr, folder_path_lidarr: str, preview: list = None) -> tup
     return (cmd.get("id"), len(preview), len(accepted))
 
 
-def find_orphan_folders(downloads_dir: str, state: State) -> list:
-    """
-    Return absolute paths of subfolders of `downloads_dir` that need evaluation.
+# Format-bucket folder names produced by slskd_hook (FLAC-16, MP3-320, OPUS, ...)
+_FORMAT_BUCKET_RE = re.compile(
+    r"^(FLAC-\d+|MP3-(?:VBR|\d+)|OGG|OPUS|M4A|AAC|WAV|AIFF|APE)$"
+)
 
-    A folder is included when it is not currently tracked by an in-flight slskd
-    grab and does not already carry a terminal status in the orphans table.
-    Pending entries are NOT skipped — they get re-evaluated each cycle so that
-    folders matching newly wanted albums get auto-imported on the next scan.
+
+def _common_folder(files: list, downloads_dir: str) -> str:
+    """LCA of `files`, clamped to one level below downloads_dir at minimum."""
+    if not files:
+        return ""
+    if len(files) == 1:
+        folder = os.path.dirname(files[0])
+    else:
+        folder = os.path.commonpath(files)
+    if os.path.normpath(folder) == os.path.normpath(downloads_dir):
+        folder = os.path.dirname(files[0])
+    return folder
+
+
+def _norm_key(s: str) -> str:
+    """Normalize artist/album text for grouping: lowercase, collapse whitespace,
+    strip spaces around `/`, `-`, and `:` so 'Either / Or' and 'Either/Or'
+    collapse to one bucket."""
+    if not s:
+        return ""
+    s = s.lower().strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s*([/\-:])\s*", r"\1", s)
+    return s
+
+
+def _orphan_id(artist: str, album: str, fmt: str, scope: str = "", fallback_path: str = "") -> str:
+    """
+    Composite orphan key: a stable hash of (norm_artist, norm_album, format,
+    album-folder basename). The on-disk album-folder name disambiguates
+    case-variant duplicates that resolve to the same canonical metadata
+    (e.g. 'To Be Everywhere Is to Be Nowhere' and 'To Be Everywhere Is To Be
+    Nowhere' tags pointing at two different physical folders); without it,
+    they'd collide under one id and the LCA would collapse up to the artist
+    root, polluting the preview with files from sibling albums.
+    """
+    if artist and album:
+        raw = f"{_norm_key(artist)}|{_norm_key(album)}|{fmt}|{scope}"
+    else:
+        raw = f"__fallback__|{fallback_path}|{fmt}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _format_for(file_path: str) -> str:
+    """Return the format-bucket label for `file_path`. Uses the slskd_hook
+    bucket name when the file sits directly in such a folder (FLAC-24,
+    MP3-VBR, ...); otherwise falls back to the bare extension uppercased."""
+    parent = os.path.basename(os.path.dirname(file_path))
+    if _FORMAT_BUCKET_RE.match(parent):
+        return parent
+    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+    return ext.upper() or "UNKNOWN"
+
+
+def _scope_for(file_path: str, downloads_dir: str) -> str:
+    """Return the basename of the on-disk album folder for `file_path` —
+    the file's parent dir, climbed one level if that dir is a format bucket.
+    Empty string if the file sits directly at downloads_dir.
+
+    Used to keep two case-variant folders for the same canonical (artist,
+    album, format) tuple from being grouped together (which would collapse
+    the LCA up to the artist root)."""
+    parent = os.path.dirname(file_path)
+    if _FORMAT_BUCKET_RE.match(os.path.basename(parent)):
+        parent = os.path.dirname(parent)
+    if os.path.normpath(parent) == os.path.normpath(downloads_dir):
+        return ""
+    return os.path.basename(parent)
+
+
+def _read_album_tags(path: str) -> tuple:
+    """Return (albumartist, album, year) read from `path`, blanks on failure."""
+    try:
+        f = music_tag.load_file(path)
+        artist = str(f.get("albumartist") or f.get("artist") or "").strip()
+        album = str(f.get("album") or "").strip()
+        year = str(f.get("year") or "").strip()
+        return artist, album, year
+    except Exception:
+        return "", "", ""
+
+
+def find_orphan_albums(downloads_dir: str) -> list:
+    """
+    Walk `downloads_dir` and return per-(artist, album, format) orphan
+    candidates.
+
+    Audio files are grouped by (norm_artist, norm_album, format, scope), where
+    format is the slskd_hook format-bucket folder name (FLAC-24, MP3-VBR, ...)
+    or the bare extension uppercased; scope is the on-disk album-folder
+    basename (parent of the format bucket). Artist/album keys are normalized
+    (lowercase, whitespace collapsed, no spaces around `/-:`) so 'Either / Or'
+    and 'Either/Or' tags merge into one row when they share an album folder;
+    scope keeps two case-variant album folders for the same canonical metadata
+    distinct so the LCA doesn't collapse up to the artist root.
+
+    Files whose tags can't be read fall back to grouping by their immediate
+    parent directory + format. Fallback buckets are absorbed into a tagged
+    group when the parent lies inside that group's folder so partially-tagged
+    albums don't split into multiple rows.
+
+    Each returned dict has: folder_path, audio_files, metadata (may be None),
+    format.
     """
     try:
-        entries = sorted(os.listdir(downloads_dir))
+        top_entries = sorted(os.listdir(downloads_dir))
     except OSError:
         return []
 
-    tracked = state.get_tracked_folder_names()
+    groups: dict = {}      # (norm_artist, norm_album, format, scope) -> {files, metadata, format, scope}
+    fallback: dict = {}    # (parent_dir, format) -> {files, format}
+
+    for top in top_entries:
+        if any(top.startswith(p) for p in SKIP_FOLDER_PREFIXES):
+            continue
+        top_path = os.path.join(downloads_dir, top)
+        if not os.path.isdir(top_path):
+            continue
+        for dirpath, dirnames, filenames in os.walk(top_path):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if not is_audio(name):
+                    continue
+                full = os.path.join(dirpath, name)
+                fmt = _format_for(full)
+                scope = _scope_for(full, downloads_dir)
+                artist, album, year = _read_album_tags(full)
+                if artist and album:
+                    key = (_norm_key(artist), _norm_key(album), fmt, scope)
+                    g = groups.setdefault(
+                        key,
+                        {
+                            "files": [],
+                            "metadata": {"artist": artist, "album": album, "year": year},
+                            "format": fmt,
+                            "scope": scope,
+                        },
+                    )
+                    g["files"].append(full)
+                else:
+                    fb_key = (dirpath, fmt)
+                    fallback.setdefault(
+                        fb_key, {"files": [], "format": fmt}
+                    )["files"].append(full)
+
+    # First pass: compute folders for tagged groups.
+    for g in groups.values():
+        g["folder"] = _common_folder(g["files"], downloads_dir)
+
+    # Absorb fallback buckets whose parent dir lies inside a tagged group's
+    # folder AND whose format matches (covers / .nfo / one untagged track in a
+    # tagged album); a different format must stay its own row.
+    leftover_fallback: dict = {}
+    for (parent, fmt), fb in fallback.items():
+        absorbed = False
+        for g in groups.values():
+            folder = g["folder"]
+            if g["format"] == fmt and (parent == folder or parent.startswith(folder + os.sep)):
+                g["files"].extend(fb["files"])
+                absorbed = True
+                break
+        if not absorbed:
+            leftover_fallback[(parent, fmt)] = fb
+
     candidates = []
-    for name in entries:
-        if any(name.startswith(p) for p in SKIP_FOLDER_PREFIXES):
-            continue
-        path = os.path.join(downloads_dir, name)
-        if not os.path.isdir(path):
-            continue
-        if name in tracked:
-            continue
-        if state.is_orphan_resolved(path):
-            continue
-        candidates.append(path)
+    for g in groups.values():
+        folder = _common_folder(g["files"], downloads_dir)
+        meta = g["metadata"]
+        candidates.append({
+            "id": _orphan_id(meta["artist"], meta["album"], g["format"], g["scope"]),
+            "folder_path": folder,
+            "audio_files": sorted(g["files"]),
+            "metadata": meta,
+            "format": g["format"],
+        })
+    for (parent, fmt), fb in leftover_fallback.items():
+        candidates.append({
+            "id": _orphan_id("", "", fmt, fallback_path=parent),
+            "folder_path": parent,
+            "audio_files": sorted(fb["files"]),
+            "metadata": None,
+            "format": fmt,
+        })
     return candidates
 
 
@@ -323,6 +463,7 @@ def _audio_files_in(folder_path: str) -> list:
 
 
 def process_orphan(
+    orphan_id: str,
     folder_path: str,
     state: State,
     lidarr,
@@ -332,21 +473,37 @@ def process_orphan(
     artist_match_ratio: float,
     album_match_ratio: float,
     command_timeout: int = 60,
-    prepare_options: dict = None,
+    metadata: dict = None,
+    album_format: str = "",
 ) -> str:
     """
-    Process one orphan folder.
+    Process one orphan release.
+
+    Identity is the composite `orphan_id` derived from (artist, album, format)
+    — see `_orphan_id`. The on-disk `folder_path` is used for filesystem
+    actions but is not the storage key.
 
     Auto-import is attempted ONLY when the fuzzy-matched album is currently in
     Lidarr's wanted list (missing or cutoff_unmet). For everything else the
     orphan is recorded with status `pending` and surfaced through the orphans
     UI for manual user action.
+
+    `metadata` is supplied by `find_orphan_albums` (the only caller). When the
+    folder had no readable audio at scan time, metadata is None and the entry
+    is recorded as `empty`.
     """
-    metadata = read_album_metadata(folder_path)
     if not metadata:
-        logger.info(f"Orphan: no audio metadata readable in {folder_path}")
-        state.mark_orphan_scanned(folder_path, status=State.ORPHAN_STATUS_EMPTY)
+        logger.info(f"Orphan: no audio metadata available for {folder_path}")
+        state.mark_orphan_scanned(
+            orphan_id,
+            folder_path=folder_path,
+            status=State.ORPHAN_STATUS_EMPTY,
+            album_format=album_format,
+        )
         return State.ORPHAN_STATUS_EMPTY
+
+    artist = metadata["artist"]
+    album = metadata["album"]
 
     matched_id = find_lidarr_album_id(
         metadata, lidarr, artist_match_ratio, album_match_ratio
@@ -363,17 +520,25 @@ def process_orphan(
         preview = []
     rejections = unique_rejections(preview)
 
+    common_kwargs = dict(
+        folder_path=folder_path,
+        artist=artist,
+        album=album,
+        album_format=album_format,
+    )
+
     if not matched_id or matched_id not in wanted_album_ids:
         # Not in the user's current wanted list — record for UI review and stop.
         state.mark_orphan_scanned(
-            folder_path,
+            orphan_id,
             status=State.ORPHAN_STATUS_PENDING,
             matched_album_id=matched_id,
             rejections=rejections,
+            **common_kwargs,
         )
         logger.info(
             f"Orphan {folder_path} -> pending "
-            f"(artist='{metadata['artist']}' album='{metadata['album']}' "
+            f"(artist='{artist}' album='{album}' "
             f"matched_album_id={matched_id})"
         )
         return State.ORPHAN_STATUS_PENDING
@@ -381,20 +546,8 @@ def process_orphan(
     # Album is wanted. Try ManualImport.
     logger.info(
         f"Orphan {folder_path} matches wanted album_id={matched_id} "
-        f"(artist='{metadata['artist']}' album='{metadata['album']}'). Auto-importing."
+        f"(artist='{artist}' album='{album}'). Auto-importing."
     )
-
-    # Optional Phase 3 preparation: rewrite weak tags / rename files so Lidarr
-    # has a clean folder to import. Discard the cached preview because the
-    # rewrite changes file paths and tags.
-    if prepare_options and prepare_options.get("enabled", True):
-        try:
-            from prepare import prepare_for_import
-            result = prepare_for_import(folder_path, lidarr, matched_id, prepare_options)
-            if result and (result.get("tagged") or result.get("renamed")):
-                preview = None  # force fresh preview after files moved/retagged
-        except Exception:
-            logger.warning("Prepare step failed; continuing with original files", exc_info=True)
 
     try:
         command_id, candidate_count, accepted_count = _manual_import(
@@ -403,20 +556,22 @@ def process_orphan(
     except Exception:
         logger.exception(f"Orphan: failed to enqueue Lidarr ManualImport for {folder_path}")
         state.mark_orphan_scanned(
-            folder_path,
+            orphan_id,
             status=State.ORPHAN_STATUS_ERROR,
             matched_album_id=matched_id,
             rejections=rejections,
+            **common_kwargs,
         )
         return State.ORPHAN_STATUS_ERROR
 
     if accepted_count == 0:
         state.mark_orphan_scanned(
-            folder_path,
+            orphan_id,
             status=State.ORPHAN_STATUS_NO_MATCH,
             matched_album_id=matched_id,
             imported_count=0,
             rejections=rejections,
+            **common_kwargs,
         )
         logger.info(
             f"Orphan {folder_path} -> no_match "
@@ -429,11 +584,12 @@ def process_orphan(
 
     if result.get("status") == "timeout":
         state.mark_orphan_scanned(
-            folder_path,
+            orphan_id,
             status=State.ORPHAN_STATUS_ERROR,
             matched_album_id=matched_id,
             lidarr_command_id=command_id,
             rejections=rejections,
+            **common_kwargs,
         )
         logger.warning(f"Orphan {folder_path} -> error (Lidarr command timeout)")
         return State.ORPHAN_STATUS_ERROR
@@ -452,19 +608,81 @@ def process_orphan(
                 f"Orphan {folder_path}: imported {imported} but rmtree failed",
                 exc_info=True,
             )
-        state.remove_orphan(folder_path)
+        state.remove_orphan(orphan_id)
+        # Drop the matching state.albums entry too — the album reached its
+        # destination, so the SUCCEEDED tracker has served its purpose. Without
+        # this, filter_list keeps treating the album as in-flight forever
+        # (since SUCCEEDED is in TRACKED_STATES).
+        if matched_id:
+            state.cleanup_terminal(matched_id)
         return "auto_imported"  # not a stored status — folder is gone
 
     state.mark_orphan_scanned(
-        folder_path,
+        orphan_id,
         status=State.ORPHAN_STATUS_NO_MATCH,
         matched_album_id=matched_id,
         lidarr_command_id=command_id,
         imported_count=0,
         rejections=rejections,
+        **common_kwargs,
     )
     logger.info(f"Orphan {folder_path} -> no_match (command completed but 0 imported)")
     return State.ORPHAN_STATUS_NO_MATCH
+
+
+# Statuses set by an explicit user action — never auto-superseded.
+_USER_STATUSES = {State.ORPHAN_STATUS_IGNORED, State.ORPHAN_STATUS_DELETED}
+
+
+def _prune_superseded(state: State, candidates: list) -> None:
+    """
+    Drop stale orphan entries:
+      a) whose folder is now an ancestor of a deeper detected album folder
+         (e.g. the artist root being superseded by per-format children);
+      b) whose folder_path matches a current candidate but whose id no
+         longer does — happens when the id derivation rule changes (scope
+         disambiguator added, etc.) and old records would otherwise live
+         alongside the freshly-keyed ones; and
+      c) whose folder no longer exists on disk (album folder removed,
+         consolidated into a case-variant sibling, etc.).
+
+    `ignored` / `deleted` entries are preserved — they reflect explicit user
+    choices. Everything else (pending, downloading, no_match, error,
+    partial_imported, empty) is system-set and gets re-evaluated against
+    the new structure.
+    """
+    candidate_paths = [c["folder_path"] for c in candidates]
+    expected_ids_by_folder: dict = {}
+    for c in candidates:
+        expected_ids_by_folder.setdefault(c["folder_path"], set()).add(c["id"])
+
+    for entry in list(state.list_orphans()):
+        if entry.get("status") in _USER_STATUSES:
+            continue
+        old = entry.get("folder_path") or ""
+        old_id = entry.get("id") or ""
+        if not old:
+            continue
+        # (a) ancestor relationship
+        ancestor_drop = False
+        for new in candidate_paths:
+            if new != old and new.startswith(old + os.sep):
+                state.remove_orphan(old_id)
+                logger.info(f"Orphan {old} superseded by deeper entries; removed")
+                ancestor_drop = True
+                break
+        if ancestor_drop:
+            continue
+        # (b) same folder, mismatched id (id format change)
+        expected = expected_ids_by_folder.get(old, set())
+        if expected and old_id and old_id not in expected:
+            state.remove_orphan(old_id)
+            logger.info(f"Orphan {old} stale id {old_id} replaced; removed")
+            continue
+        # (c) folder no longer on disk
+        if not os.path.isdir(old):
+            state.remove_orphan(old_id)
+            logger.info(f"Orphan {old} folder gone; removed")
 
 
 def process_all_orphans(
@@ -475,21 +693,34 @@ def process_all_orphans(
     artist_match_ratio: float = 0.85,
     album_match_ratio: float = 0.85,
     command_timeout: int = 60,
-    prepare_options: dict = None,
 ) -> int:
-    """Entry point. Returns the count of folders evaluated this cycle."""
-    candidates = find_orphan_folders(soularr_downloads_dir, state)
+    """Entry point. Returns the count of orphans evaluated this cycle."""
+    found = find_orphan_albums(soularr_downloads_dir)
+
+    # Always prune — even when no candidates were found we still want to clean
+    # up state.orphans entries whose folders have disappeared (consolidated
+    # into a case-variant sibling, manually deleted, etc.).
+    _prune_superseded(state, found)
+    if not found:
+        return 0
+
+    # Skip already-resolved entries (terminal statuses set by previous scans
+    # or explicit UI actions). Pending entries are re-evaluated each cycle so
+    # they auto-import once the album lands in the wanted list.
+    candidates = [c for c in found if not state.is_orphan_resolved(c["id"])]
     if not candidates:
         return 0
+
     wanted_album_ids = fetch_wanted_album_ids(lidarr)
     logger.info(
-        f"Orphan scan: {len(candidates)} candidate folder(s) "
+        f"Orphan scan: {len(candidates)} album-level candidate(s) "
         f"({len(wanted_album_ids)} wanted album ids loaded)"
     )
-    for path in candidates:
+    for c in candidates:
         try:
             process_orphan(
-                folder_path=path,
+                orphan_id=c["id"],
+                folder_path=c["folder_path"],
                 state=state,
                 lidarr=lidarr,
                 wanted_album_ids=wanted_album_ids,
@@ -498,8 +729,9 @@ def process_all_orphans(
                 artist_match_ratio=artist_match_ratio,
                 album_match_ratio=album_match_ratio,
                 command_timeout=command_timeout,
-                prepare_options=prepare_options,
+                metadata=c["metadata"],
+                album_format=c["format"],
             )
         except Exception:
-            logger.exception(f"Unhandled error while processing orphan {path}")
+            logger.exception(f"Unhandled error while processing orphan {c['folder_path']}")
     return len(candidates)
