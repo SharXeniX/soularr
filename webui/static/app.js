@@ -289,7 +289,6 @@ function removeFailedImport(albumId) {
 
 const ORPHAN_STATUS_LABEL = {
     pending: 'Pending',
-    downloading: 'Downloading',
     partial_imported: 'Partial',
     no_match: 'No match',
     error: 'Error',
@@ -347,6 +346,7 @@ function loadOrphans() {
                 const folderTip = `${folder} — status: ${label}`;
 
                 const statusBadge = `<span class="orphan-status orphan-status-${it.status}">${label}</span>`;
+                tr.dataset.orphanId = id;
                 tr.innerHTML = `
                     <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${statusBadge} ${artist}</td>
                     <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${baseAlbum}${inLibNote}</td>
@@ -355,12 +355,12 @@ function loadOrphans() {
                     <td class="orphan-clickable" onclick="previewOrphan('${id}')" title="${folderTip}">${rejectionText}</td>
                     <td>
                         <div class="row-actions">
-                            <button class="toolbar-btn" onclick="importOrphan('${id}', false)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
-                            <button class="toolbar-btn" title="${forceTooltip}" onclick="importOrphan('${id}', true)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
+                            <button class="toolbar-btn" onclick="importOrphan('${id}', false, this)" ${audioCount === 0 ? 'disabled' : ''}>Import</button>
+                            <button class="toolbar-btn" title="${forceTooltip}" onclick="importOrphan('${id}', true, this)" ${audioCount === 0 ? 'disabled' : ''}>Force</button>
                             <span class="actions-divider"></span>
-                            <button class="toolbar-btn" onclick="rescanOrphan('${id}')">Re-scan</button>
-                            <button class="toolbar-btn" onclick="ignoreOrphan('${id}')">Ignore</button>
-                            <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${id}')">Delete</button>
+                            <button class="toolbar-btn" onclick="rescanOrphan('${id}', this)">Re-scan</button>
+                            <button class="toolbar-btn" onclick="ignoreOrphan('${id}', this)">Ignore</button>
+                            <button class="toolbar-btn remove-btn" onclick="deleteOrphan('${id}', this)">Delete</button>
                         </div>
                     </td>
                 `;
@@ -379,8 +379,10 @@ function _orphanAction(orphanId, endpoint, body) {
     }).then(r => r.json());
 }
 
-function importOrphan(id, force) {
-    _orphanAction(id, 'import', { force: !!force }).then(r => {
+function importOrphan(id, force, btn) {
+    _withButtonBusy(btn, force ? 'Forcing…' : 'Importing…', () =>
+        _orphanAction(id, 'import', { force: !!force })
+    ).then(r => {
         if (r.error) {
             alert(`Import error: ${r.error}`);
         } else if (r.imported_count > 0) {
@@ -392,17 +394,34 @@ function importOrphan(id, force) {
     });
 }
 
-function ignoreOrphan(id) {
-    _orphanAction(id, 'ignore').then(() => loadOrphans());
+function _withButtonBusy(btn, label, fn) {
+    if (!btn) return fn();
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = label;
+    return fn().finally(() => {
+        btn.disabled = false;
+        btn.textContent = orig;
+    });
 }
 
-function rescanOrphan(id) {
-    _orphanAction(id, 'rescan').then(() => loadOrphans());
+function ignoreOrphan(id, btn) {
+    _withButtonBusy(btn, 'Ignoring…', () => _orphanAction(id, 'ignore'))
+        .then(() => loadOrphans());
 }
 
-function deleteOrphan(id) {
+function rescanOrphan(id, btn) {
+    _withButtonBusy(btn, 'Scanning…', () => _orphanAction(id, 'rescan'))
+        .then(r => {
+            if (r && r.error) alert('Re-scan failed: ' + r.error);
+            loadOrphans();
+        });
+}
+
+function deleteOrphan(id, btn) {
     if (!confirm('Delete the orphan folder from disk? This removes all files in the folder.')) return;
-    _orphanAction(id, 'delete').then(() => loadOrphans());
+    _withButtonBusy(btn, 'Deleting…', () => _orphanAction(id, 'delete'))
+        .then(() => loadOrphans());
 }
 
 function previewOrphan(id) {

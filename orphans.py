@@ -509,27 +509,6 @@ def process_orphan(
         metadata, lidarr, artist_match_ratio, album_match_ratio
     )
 
-    # An album currently being grabbed by the normal soularr flow is not an
-    # orphan in the strict sense — monitor_downloads will handle the import.
-    # Surface it in the UI with status `downloading` so the user can see what's
-    # on disk and where it's going, but skip the wanted-list check and
-    # ManualImport call so we don't race with monitor_downloads.
-    if matched_id and matched_id in state.in_flight_album_ids():
-        state.mark_orphan_scanned(
-            orphan_id,
-            folder_path=folder_path,
-            status=State.ORPHAN_STATUS_DOWNLOADING,
-            artist=artist,
-            album=album,
-            album_format=album_format,
-            matched_album_id=matched_id,
-        )
-        logger.info(
-            f"Orphan {folder_path} -> downloading "
-            f"(artist='{artist}' album='{album}' matched_album_id={matched_id})"
-        )
-        return State.ORPHAN_STATUS_DOWNLOADING
-
     # Always fetch Lidarr's manualimport preview so we can store the rejection
     # reasons regardless of whether we end up auto-importing — it gives the
     # user useful 'why is this here' info in the orphans UI.

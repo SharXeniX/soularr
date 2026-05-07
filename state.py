@@ -36,14 +36,20 @@ STATE_SUCCEEDED = "succeeded"
 STATE_FAILED = "failed"
 STATE_ABANDONED = "abandoned"
 
-IN_FLIGHT_STATES = {STATE_QUEUED, STATE_DOWNLOADING, STATE_PARTIAL}
+# Album-level states still seeing slskd transfer activity. Used by the orphan
+# scan to mark a folder as `downloading` (skip auto-import; let
+# monitor_downloads finish the grab). PARTIAL is intentionally excluded —
+# it means "some succeeded, some bad, nothing active" so the slskd grab is
+# done evolving and the orphan flow should import what arrived.
+IN_FLIGHT_STATES = {STATE_QUEUED, STATE_DOWNLOADING}
 TERMINAL_STATES = {STATE_SUCCEEDED, STATE_FAILED, STATE_ABANDONED}
 
-# Albums that should still be considered "owned" by soularr/slskd: actively
-# transferring (IN_FLIGHT) or already on disk awaiting Lidarr import
-# (SUCCEEDED, transient until orphan auto-import or user UI action drops it).
-# Used by filter_list to avoid re-grabbing files that are already there.
-TRACKED_STATES = IN_FLIGHT_STATES | {STATE_SUCCEEDED}
+# Albums that should still be considered "owned" by soularr/slskd: anything
+# that hasn't been cleaned up via cleanup_terminal yet. Used by filter_list
+# (don't re-grab) and adopt (don't re-adopt) to avoid spawning duplicate
+# downloads while a tracker exists. PARTIAL and SUCCEEDED both mean files
+# are on disk awaiting an import that will eventually clear the tracker.
+TRACKED_STATES = IN_FLIGHT_STATES | {STATE_SUCCEEDED, STATE_PARTIAL}
 
 
 def _now() -> str:
@@ -372,7 +378,6 @@ class State:
     # there is nothing to track. Anything else either awaits user action via the
     # orphans UI page or is already at a terminal state.
     ORPHAN_STATUS_PENDING = "pending"            # detected, not in wanted list — awaits UI action
-    ORPHAN_STATUS_DOWNLOADING = "downloading"    # currently tracked by the normal soularr/slskd flow
     ORPHAN_STATUS_PARTIAL_IMPORTED = "partial_imported"  # auto-imported some, but residual audio remains
     ORPHAN_STATUS_NO_MATCH = "no_match"          # was wanted but Lidarr rejected every file
     ORPHAN_STATUS_ERROR = "error"                # ManualImport command failed / timed out
