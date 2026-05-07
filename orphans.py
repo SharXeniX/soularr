@@ -596,7 +596,11 @@ def process_orphan(
 
     # If anything imported, the folder is considered done. Lidarr already moved
     # the matching audio files to the library; we rmtree the source folder
-    # entirely (residual audio, covers, .nfo) and drop the orphan entry.
+    # entirely (residual audio, covers, .nfo) and switch the orphan record to
+    # `imported` — a short-retention status that keeps filter_list and
+    # has_orphan_blocking_grab from re-grabbing the same album while Lidarr's
+    # wanted/cutoff endpoint is still serving stale stats. The TTL sweep in
+    # process_all_orphans drops the record after it expires.
     if imported > 0:
         try:
             shutil.rmtree(folder_path)
@@ -608,14 +612,26 @@ def process_orphan(
                 f"Orphan {folder_path}: imported {imported} but rmtree failed",
                 exc_info=True,
             )
-        state.remove_orphan(orphan_id)
-        # Drop the matching state.albums entry too — the album reached its
-        # destination, so the SUCCEEDED tracker has served its purpose. Without
-        # this, filter_list keeps treating the album as in-flight forever
-        # (since SUCCEEDED is in TRACKED_STATES).
+        state.mark_orphan_scanned(
+            orphan_id,
+            status=State.ORPHAN_STATUS_IMPORTED,
+            matched_album_id=matched_id,
+            lidarr_command_id=command_id,
+            imported_count=imported,
+            **common_kwargs,
+        )
+        # Drop the matching state.albums tracker (the album reached its
+        # destination) and force Lidarr to refresh its stats so the next
+        # cycle's wanted-list fetch reflects the new library state.
         if matched_id:
             state.cleanup_terminal(matched_id)
-        return "auto_imported"  # not a stored status — folder is gone
+            try:
+                lidarr.post_command(name="RefreshAlbum", albumIds=[matched_id])
+            except Exception:
+                logger.warning(
+                    f"RefreshAlbum failed for album {matched_id}", exc_info=True
+                )
+        return State.ORPHAN_STATUS_IMPORTED
 
     state.mark_orphan_scanned(
         orphan_id,
@@ -631,7 +647,16 @@ def process_orphan(
 
 
 # Statuses set by an explicit user action — never auto-superseded.
-_USER_STATUSES = {State.ORPHAN_STATUS_IGNORED, State.ORPHAN_STATUS_DELETED}
+# Statuses preserved by `_prune_superseded` even when their folder is gone.
+# IGNORED and DELETED are explicit user choices (audit trail). IMPORTED is a
+# short-lived retention window where we WANT the folder to be gone (rmtree'd
+# after auto-import); the TTL sweep handles cleanup, not the folder-gone
+# clause.
+_PROTECTED_STATUSES = {
+    State.ORPHAN_STATUS_IGNORED,
+    State.ORPHAN_STATUS_DELETED,
+    State.ORPHAN_STATUS_IMPORTED,
+}
 
 
 def _prune_superseded(state: State, candidates: list) -> None:
@@ -646,10 +671,10 @@ def _prune_superseded(state: State, candidates: list) -> None:
       c) whose folder no longer exists on disk (album folder removed,
          consolidated into a case-variant sibling, etc.).
 
-    `ignored` / `deleted` entries are preserved — they reflect explicit user
-    choices. Everything else (pending, downloading, no_match, error,
-    partial_imported, empty) is system-set and gets re-evaluated against
-    the new structure.
+    `ignored` / `deleted` / `imported` entries are preserved (see
+    _PROTECTED_STATUSES). Everything else (pending, downloading, no_match,
+    error, partial_imported, empty) is system-set and gets re-evaluated
+    against the new structure.
     """
     candidate_paths = [c["folder_path"] for c in candidates]
     expected_ids_by_folder: dict = {}
@@ -657,7 +682,7 @@ def _prune_superseded(state: State, candidates: list) -> None:
         expected_ids_by_folder.setdefault(c["folder_path"], set()).add(c["id"])
 
     for entry in list(state.list_orphans()):
-        if entry.get("status") in _USER_STATUSES:
+        if entry.get("status") in _PROTECTED_STATUSES:
             continue
         old = entry.get("folder_path") or ""
         old_id = entry.get("id") or ""
@@ -695,6 +720,12 @@ def process_all_orphans(
     command_timeout: int = 60,
 ) -> int:
     """Entry point. Returns the count of orphans evaluated this cycle."""
+    # Drop expired `imported` retention records before anything else; any that
+    # outlive the TTL means Lidarr's wanted list has had ample time to settle.
+    purged = state.purge_stale_imported()
+    if purged:
+        logger.info(f"Orphan scan: dropped {purged} expired imported record(s)")
+
     found = find_orphan_albums(soularr_downloads_dir)
 
     # Always prune — even when no candidates were found we still want to clean

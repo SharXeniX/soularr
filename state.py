@@ -378,6 +378,7 @@ class State:
     # there is nothing to track. Anything else either awaits user action via the
     # orphans UI page or is already at a terminal state.
     ORPHAN_STATUS_PENDING = "pending"            # detected, not in wanted list — awaits UI action
+    ORPHAN_STATUS_IMPORTED = "imported"          # auto-imported successfully; short retention bridges Lidarr stat staleness
     ORPHAN_STATUS_PARTIAL_IMPORTED = "partial_imported"  # auto-imported some, but residual audio remains
     ORPHAN_STATUS_NO_MATCH = "no_match"          # was wanted but Lidarr rejected every file
     ORPHAN_STATUS_ERROR = "error"                # ManualImport command failed / timed out
@@ -388,8 +389,9 @@ class State:
     # Pending orphans are RE-EVALUATED on every scan because the wanted list is
     # mutable: an album the user adds or re-monitors should auto-import the next
     # time we see its folder. Everything else is terminal until the user clears
-    # the entry from the UI.
+    # the entry from the UI (or the TTL sweep drops `imported`).
     _ORPHAN_TERMINAL_STATUSES = {
+        ORPHAN_STATUS_IMPORTED,
         ORPHAN_STATUS_PARTIAL_IMPORTED,
         ORPHAN_STATUS_NO_MATCH,
         ORPHAN_STATUS_ERROR,
@@ -398,13 +400,15 @@ class State:
         ORPHAN_STATUS_DELETED,
     }
 
-    # Orphan statuses that mean "files are on disk and pending some action" —
-    # if any orphan record with matched_album_id == X has one of these, soularr
+    # Orphan statuses that mean "files are on disk and pending some action" or
+    # "we just finished and Lidarr's wanted list might still be stale" — if any
+    # orphan record with matched_album_id == X has one of these, soularr
     # should NOT grab a fresh copy of album X. The orphan flow (or user) will
     # handle import; re-grabbing wastes bandwidth and creates duplicates.
     _ORPHAN_BLOCKS_GRAB = {
         "pending",
         "downloading",
+        "imported",
         "no_match",
         "partial_imported",
         "error",
@@ -485,3 +489,29 @@ class State:
         Q = Query()
         with self._flock():
             self._orphans.remove(Q.id == orphan_id)
+
+    def purge_stale_imported(self, max_age_seconds: int = 900) -> int:
+        """
+        Remove orphan records with status `imported` older than max_age_seconds.
+
+        `imported` is a brief retention window written right after a successful
+        auto-import: it bridges the time during which Lidarr's wanted/cutoff
+        endpoint may still report the album as needing a grab, even though the
+        files are already in the library. After the window the album either
+        left wanted (Lidarr stats refreshed) or genuinely needs another grab,
+        so the record can be dropped.
+        """
+        Q = Query()
+        cutoff = datetime.now(timezone.utc).timestamp() - max_age_seconds
+        removed = 0
+        with self._flock():
+            for doc in list(self._orphans.search(Q.status == self.ORPHAN_STATUS_IMPORTED)):
+                ts_str = doc.get("scanned_at") or ""
+                try:
+                    ts = datetime.fromisoformat(ts_str).timestamp()
+                except ValueError:
+                    ts = 0
+                if ts < cutoff:
+                    self._orphans.remove(doc_ids=[doc.doc_id])
+                    removed += 1
+        return removed

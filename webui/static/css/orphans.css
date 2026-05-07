@@ -27,6 +27,7 @@
     background: #404040;
 }
 .orphan-status-pending          { background: #5a4a1a; color: #f0d080; }
+.orphan-status-imported         { background: #1a5a3a; color: #80f0a0; }
 .orphan-status-no_match         { background: #5a1a30; color: #f08090; }
 .orphan-status-error            { background: #5a1a1a; color: #f08080; }
 .orphan-status-partial_imported { background: #3a5a1a; color: #a0e070; }

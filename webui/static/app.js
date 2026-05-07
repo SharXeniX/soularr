@@ -289,6 +289,7 @@ function removeFailedImport(albumId) {
 
 const ORPHAN_STATUS_LABEL = {
     pending: 'Pending',
+    imported: 'Imported',
     partial_imported: 'Partial',
     no_match: 'No match',
     error: 'Error',

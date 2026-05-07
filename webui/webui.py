@@ -436,24 +436,36 @@ def import_orphan():
         # Wait for the command and report imported count.
         result = orphans_mod._wait_for_command(lidarr, cmd["id"], timeout=60)
         imported = orphans_mod._parse_imported_count(result.get("message", ""))
-        # If anything imported, the folder is considered done — rmtree it entirely
-        # (covers residual audio Lidarr didn't accept, covers, .nfo, etc.) and
-        # drop the orphan entry. If nothing imported, leave the folder as-is so
-        # the user can retry with `force` or take other action.
+        # If anything imported, the folder is considered done — rmtree it
+        # entirely (covers residual audio Lidarr didn't accept, covers, .nfo)
+        # and switch the orphan record to `imported` so filter_list keeps
+        # blocking re-grabs through Lidarr's stat-staleness window. The TTL
+        # sweep in process_all_orphans drops the record after it expires.
         if imported > 0:
             if os.path.isdir(folder):
                 try:
                     shutil.rmtree(folder)
                 except OSError:
                     logger.warning(f"rmtree failed for {folder}", exc_info=True)
-            state.remove_orphan(orphan_id)
-            # Also drop the state.albums tracker so filter_list doesn't keep
-            # treating the album as in-flight forever (SUCCEEDED is in
-            # TRACKED_STATES, which is correct while files are awaiting import
-            # but stale once Lidarr has moved them).
             matched = entry.get("matched_album_id")
+            state.mark_orphan_scanned(
+                orphan_id,
+                status=State.ORPHAN_STATUS_IMPORTED,
+                matched_album_id=matched,
+                lidarr_command_id=cmd["id"],
+                imported_count=imported,
+            )
+            # Drop the state.albums tracker (album reached its destination)
+            # and force Lidarr to refresh stats so the next cycle's wanted
+            # fetch reflects reality.
             if matched:
                 state.cleanup_terminal(matched)
+                try:
+                    lidarr.post_command(name="RefreshAlbum", albumIds=[matched])
+                except Exception:
+                    logger.warning(
+                        f"RefreshAlbum failed for album {matched}", exc_info=True
+                    )
         else:
             state.mark_orphan_scanned(
                 orphan_id,
