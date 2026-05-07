@@ -38,6 +38,23 @@ def _clean(value: str) -> str:
     return out.rstrip(".")
 
 
+def _resolve_canonical_subfolder(parent: str, name: str) -> str:
+    """Return the existing case of a subfolder of `parent` that matches `name`
+    case-insensitively, or `name` unchanged if no such folder exists. Prevents
+    case-variant duplicates ('Either_Or' next to 'either_or') when two peers
+    share the same album with slightly different tag casing."""
+    if not name or not os.path.isdir(parent):
+        return name
+    target = name.lower()
+    try:
+        for entry in os.listdir(parent):
+            if entry.lower() == target:
+                return entry
+    except OSError:
+        pass
+    return name
+
+
 def _snap_cbr(kbps: float) -> int:
     return min(_CBR_TARGETS, key=lambda t: abs(kbps - t))
 
@@ -135,13 +152,20 @@ def organize(local_path: str, downloads_root: str = "/downloads") -> Optional[st
     bucket = _format_bucket(local_path, f.mfile)
     ext = os.path.splitext(local_path)[1]
 
-    rel = os.path.join(
-        _clean(artist),
-        _clean(album),
-        bucket,
-        f"{track_num:02d} - {_clean(title)}{ext}",
+    # Build the destination path level-by-level, reusing an existing folder
+    # when one matches case-insensitively at each step. Otherwise two peers
+    # uploading the same album with subtly different tag casing produce
+    # parallel folder trees ('Either_Or' next to 'either_or').
+    artist_dir = os.path.join(
+        downloads_root, _resolve_canonical_subfolder(downloads_root, _clean(artist))
     )
-    target = os.path.join(downloads_root, rel)
+    album_dir = os.path.join(
+        artist_dir, _resolve_canonical_subfolder(artist_dir, _clean(album))
+    )
+    bucket_dir = os.path.join(
+        album_dir, _resolve_canonical_subfolder(album_dir, bucket)
+    )
+    target = os.path.join(bucket_dir, f"{track_num:02d} - {_clean(title)}{ext}")
 
     if os.path.normpath(target) == os.path.normpath(local_path):
         return target

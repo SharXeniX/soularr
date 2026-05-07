@@ -659,19 +659,19 @@ def _prune_superseded(state: State, candidates: list) -> None:
     """
     Drop stale orphan entries:
       a) whose folder is now an ancestor of a deeper detected album folder
-         (e.g. the artist root being superseded by per-format children); and
+         (e.g. the artist root being superseded by per-format children);
       b) whose folder_path matches a current candidate but whose id no
          longer does — happens when the id derivation rule changes (scope
          disambiguator added, etc.) and old records would otherwise live
-         alongside the freshly-keyed ones.
+         alongside the freshly-keyed ones; and
+      c) whose folder no longer exists on disk (album folder removed,
+         consolidated into a case-variant sibling, etc.).
 
     `ignored` / `deleted` entries are preserved — they reflect explicit user
     choices. Everything else (pending, downloading, no_match, error,
     partial_imported, empty) is system-set and gets re-evaluated against
     the new structure.
     """
-    if not candidates:
-        return
     candidate_paths = [c["folder_path"] for c in candidates]
     expected_ids_by_folder: dict = {}
     for c in candidates:
@@ -699,6 +699,11 @@ def _prune_superseded(state: State, candidates: list) -> None:
         if expected and old_id and old_id not in expected:
             state.remove_orphan(old_id)
             logger.info(f"Orphan {old} stale id {old_id} replaced; removed")
+            continue
+        # (c) folder no longer on disk
+        if not os.path.isdir(old):
+            state.remove_orphan(old_id)
+            logger.info(f"Orphan {old} folder gone; removed")
 
 
 def process_all_orphans(
@@ -712,10 +717,13 @@ def process_all_orphans(
 ) -> int:
     """Entry point. Returns the count of orphans evaluated this cycle."""
     found = find_orphan_albums(soularr_downloads_dir)
+
+    # Always prune — even when no candidates were found we still want to clean
+    # up state.orphans entries whose folders have disappeared (consolidated
+    # into a case-variant sibling, manually deleted, etc.).
+    _prune_superseded(state, found)
     if not found:
         return 0
-
-    _prune_superseded(state, found)
 
     # Skip already-resolved entries (terminal statuses set by previous scans
     # or explicit UI actions). Pending entries are re-evaluated each cycle so
